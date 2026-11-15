@@ -238,8 +238,18 @@ def _set_job(key, **fields):
 
 
 def _run_build(key, params):
+    cancel_event = None
+    with JOBS_LOCK:
+        job = JOBS.get(key)
+        if job and "cancel_event" in job:
+            cancel_event = job["cancel_event"]
+
     def progress(stage, done, total):
-        _set_job(key, stage=stage, done=int(done), total=int(total))
+        if stage == "preview":
+            _set_job(key, preview_ready=True, preview_frames=int(done),
+                     planned_frames=int(total), stage="preview")
+        else:
+            _set_job(key, stage=stage, done=int(done), total=int(total))
 
     _set_job(key, state="running", stage="query", done=0, total=0, error=None)
     try:
@@ -250,9 +260,14 @@ def _run_build(key, params):
             proper_motion=(params["pm"][0] * u.mas / u.yr,
                            params["pm"][1] * u.mas / u.yr),
             progress=progress,
+            should_cancel=cancel_event.is_set if cancel_event is not None else None,
         )
         _set_job(key, state="ready", stage="ready", error=None,
                  done=1, total=1)
+    except pipeline.BuildCancelled:
+        print(f"build cancelled for {key}")
+        _set_job(key, state="cancelled", stage="cancelled",
+                 error="Build was cancelled.")
     except Exception as exc:                    # noqa: BLE001 - report to the page
         traceback.print_exc()
         _set_job(key, state="error", stage="error", error=str(exc))
@@ -268,6 +283,11 @@ def _run_build(key, params):
 @app.get("/")
 def index():
     return send_from_directory(STATIC, "index.html")
+
+
+@app.get("/guide")
+def guide():
+    return send_file(REPO / "GUIDE.md", mimetype="text/markdown")
 
 
 @app.get("/api/targets")
@@ -300,38 +320,73 @@ def api_build():
                              params["track"])
     manifest = DATA_ROOT / key / "manifest.json"
     if manifest.exists():
-        return jsonify(id=key, state="ready", params=public_params(params))
+        try:
+            m = json.loads(manifest.read_text())
+            if m.get("complete", True):
+                return jsonify(id=key, state="ready", params=public_params(params))
+        except Exception:
+            pass
 
     with JOBS_LOCK:
         job = JOBS.get(key)
-        # No job, a failed job, or a "ready" job whose directory was deleted:
+        # No job, a failed job, a cancelled job, or a "ready" job whose directory was deleted:
         # all of those need a new build.  A queued/running job is left alone.
-        if job is None or job.get("state") in ("error", "ready"):
-            # The newest request wins.  A build that is already running is
-            # left alone (it is downloading real data), but older requests
-            # that are still queued are dropped so they do not pile up while
-            # the user clicks through targets.
+        if job is None or job.get("state") in ("error", "cancelled", "ready"):
+            # The newest request wins.  A build that is already running or
+            # queued is cancelled so the worker can immediately start the new target.
             for other_key, other in JOBS.items():
-                if other_key != key and other.get("state") == "queued":
+                if other_key != key and other.get("state") in ("queued", "running"):
+                    if "cancel_event" in other:
+                        other["cancel_event"].set()
                     other.update(
-                        state="error", stage="error",
+                        state="cancelled", stage="cancelled",
                         error="That build was replaced by a newer request. "
                               "Click Show again to run it.")
+            cancel_event = threading.Event()
             JOBS[key] = {"state": "queued", "stage": "queued",
                          "done": 0, "total": 0, "error": None,
-                         "name": params["name"], "fov": params["fov"]}
+                         "name": params["name"], "fov": params["fov"],
+                         "cancel_event": cancel_event,
+                         "preview_ready": False}
             EXECUTOR.submit(_run_build, key, params)
     return jsonify(id=key, state="queued", params=public_params(params))
+
+
+@app.post("/api/job/<key>/cancel")
+def api_job_cancel(key):
+    if not ID_RE.match(key):
+        return jsonify(error="bad dataset id"), 400
+    with JOBS_LOCK:
+        job = JOBS.get(key)
+        if not job:
+            return jsonify(error="unknown job"), 404
+        if "cancel_event" in job:
+            job["cancel_event"].set()
+        job.update(state="cancelling", stage="cancelling")
+    return jsonify(status="cancelling")
 
 
 @app.get("/api/job/<key>")
 def api_job(key):
     if not ID_RE.match(key):
         return jsonify(error="bad dataset id"), 400
-    if (DATA_ROOT / key / "manifest.json").exists():
+    manifest = DATA_ROOT / key / "manifest.json"
+    is_ready = False
+    if manifest.exists():
+        try:
+            m = json.loads(manifest.read_text())
+            if m.get("complete", True):
+                is_ready = True
+        except Exception:
+            pass
+    if is_ready:
         return jsonify(id=key, state="ready")
+
     with JOBS_LOCK:
-        job = dict(JOBS.get(key, {}))
+        raw_job = JOBS.get(key)
+        if not raw_job:
+            return jsonify(error="unknown dataset"), 404
+        job = {k: v for k, v in raw_job.items() if k != "cancel_event"}
         if job.get("state") == "queued":
             # Say what the one build worker is doing, otherwise "Queued" can
             # look like a frozen page when a long download is ahead of it.
@@ -345,8 +400,6 @@ def api_job(key):
                         "total": other.get("total", 0),
                     }
                     break
-    if not job:
-        return jsonify(error="unknown dataset"), 404
     return jsonify(id=key, **job)
 
 

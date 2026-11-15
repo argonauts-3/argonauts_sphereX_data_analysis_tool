@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -32,7 +33,7 @@ import test as pipeline
 # Bump this when the manifest schema or the rendering changes.  It is part of
 # the dataset id, so old directories are simply ignored instead of being
 # served with a new page that expects different fields.
-VERSION = 1
+VERSION = 2
 
 REPO = Path(__file__).resolve().parent
 DATA_ROOT = REPO / "data"
@@ -107,7 +108,8 @@ def _png_from_frame(image, lo, hi):
     return out.astype(np.uint8)
 
 
-def render_frames(frames, out_dir: Path, progress=None):
+def render_frames(frames, out_dir: Path, progress=None, subdir="frames",
+                  stretch_override=None, should_cancel=None):
     """Write one PNG per frame and return (stretch, frame_entries).
 
     The stretch is shared by all frames of a band so that a change in
@@ -118,16 +120,18 @@ def render_frames(frames, out_dir: Path, progress=None):
     frames = [f for f in frames if f.image_aligned is not None]
     frames.sort(key=lambda f: f.mjd)
 
-    # Per-band stretch from every aligned pixel, after removing each frame's
-    # median.  Percentiles are robust to cosmic rays and the few very bright
-    # stars in the field.
     by_band = {}
     for frame in frames:
         by_band.setdefault(frame.band, []).append(frame)
 
     background = {id(f): float(np.nanmedian(f.image_aligned)) for f in frames}
     stretch = {}
+    if stretch_override:
+        stretch.update(stretch_override)
+
     for band, band_frames in by_band.items():
+        if band in stretch:
+            continue
         values = np.concatenate([
             (f.image_aligned - background[id(f)]).ravel()
             for f in band_frames
@@ -138,22 +142,22 @@ def render_frames(frames, out_dir: Path, progress=None):
             lo, hi = 0.0, 1.0
         stretch[band] = (float(lo), float(hi))
 
-    frames_dir = out_dir / "frames"
+    frames_dir = out_dir / subdir
     frames_dir.mkdir(parents=True, exist_ok=True)
 
     entries = []
     for i, frame in enumerate(frames):
+        if should_cancel is not None and should_cancel():
+            raise pipeline.BuildCancelled("build cancelled")
         lo, hi = stretch[frame.band]
         image = frame.image_aligned - background[id(frame)]
-        name = f"frames/f{i:03d}.png"
+        name = f"{subdir}/f{i:03d}.png"
         # The WCS array has row 0 at the south edge; PIL writes row 0 at the
         # top.  Flip so the PNG is north-up like any normal image, and the
         # browser's (left, top) = (east, north) mapping needs no extra maths.
         Image.fromarray(np.flipud(_png_from_frame(image, lo, hi))).save(
             out_dir / name, optimize=True)
 
-        # Where the target sits on the sky-locked grid.  With track=True it is
-        # always the centre; with track=False it walks across the frame.
         scale_deg = frame.pixel_scale_arcsec / 3600.0
         entries.append({
             "index": i,
@@ -195,154 +199,294 @@ def render_frames(frames, out_dir: Path, progress=None):
 
 def build_dataset(ra_deg, dec_deg, dataset_key, fov_deg, t0, t1, bands,
                   track=False, proper_motion=NO_MOTION, max_frames=None,
-                  progress=None):
+                  progress=None, should_cancel=None):
     """Run the pipeline and write data/<dataset_key>/.
 
     `progress(stage, done, total)` is called often enough for a progress bar.
-    Stages: query, downloading, measuring, aligning, rendering.
+    Stages: query, downloading, measuring, aligning, rendering, preview.
     """
     out_dir = DATA_ROOT / dataset_key
-    if (out_dir / "manifest.json").exists():
-        return out_dir
+    manifest_file = out_dir / "manifest.json"
+    if manifest_file.exists():
+        try:
+            m = json.loads(manifest_file.read_text())
+            if m.get("complete", True):
+                return out_dir
+        except Exception:
+            pass
 
     def report(stage, done=0, total=0):
         if progress is not None:
             progress(stage, done, total)
 
-    target = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg, frame="icrs")
-    ra = target.ra.deg
-    dec = target.dec.deg
+    try:
+        if should_cancel is not None and should_cancel():
+            raise pipeline.BuildCancelled("build cancelled")
 
-    # --- 1. Which exposures cover this position? --------------------------
-    report("query", 0, 1)
-    position_now = pipeline.target_position_at(target, Time.now(), proper_motion)
-    sia_path = CUTOUT_ROOT / f"exposures_{ra:.3f}_{dec:.3f}.ecsv".replace("-", "m")
-    exposures = pipeline.get_exposures(position_now, pipeline.SEARCH_RADIUS_DEG,
-                                       sia_path)
-    if len(exposures) == 0:
-        raise RuntimeError("the archive has no exposures at this position")
+        target = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg, frame="icrs")
+        ra = target.ra.deg
+        dec = target.dec.deg
 
-    t_min = np.asarray(exposures["t_min"], dtype=float)
-    reference_time = Time(float(np.nanmedian(t_min)), format="mjd")
-    reference = pipeline.target_position_at(target, reference_time,
-                                            proper_motion)
+        # --- 1. Which exposures cover this position? --------------------------
+        report("query", 0, 1)
+        position_now = pipeline.target_position_at(target, Time.now(), proper_motion)
+        sia_path = CUTOUT_ROOT / f"exposures_{ra:.3f}_{dec:.3f}.ecsv".replace("-", "m")
+        exposures = pipeline.get_exposures(position_now, pipeline.SEARCH_RADIUS_DEG,
+                                           sia_path)
+        if len(exposures) == 0:
+            raise RuntimeError("the archive has no exposures at this position")
 
-    # The cutout centre is fixed on the full archive span, not on the chosen
-    # date window, so changing the dates never invalidates the download cache.
-    exposures = pipeline.select_time_range(exposures, t0, t1)
-    if len(exposures) == 0:
-        raise RuntimeError("no exposures in that time range")
+        if should_cancel is not None and should_cancel():
+            raise pipeline.BuildCancelled("build cancelled")
 
-    wanted = set(bands)
-    bands_present = [b for b in pipeline.BANDS
-                     if b in wanted
-                     and any(exposures["energy_bandpassname"] == b)]
-    if not bands_present:
-        raise RuntimeError("no exposures in the selected bands")
+        t_min = np.asarray(exposures["t_min"], dtype=float)
+        reference_time = Time(float(np.nanmedian(t_min)), format="mjd")
+        reference = pipeline.target_position_at(target, reference_time,
+                                                proper_motion)
 
-    # Safety net: a position near the galactic plane can return thousands of
-    # exposures, and every one is a multi-megabyte download.  Refuse clearly
-    # rather than fill the disk; the user can pick a shorter date range.
-    n_planned = int(sum(np.sum(exposures["energy_bandpassname"] == b)
-                        for b in bands_present))
-    if n_planned > MAX_EXPOSURES:
-        raise RuntimeError(
-            f"{n_planned} exposures match; narrow the date range or pick "
-            f"fewer detectors (limit is {MAX_EXPOSURES})")
+        # The cutout centre is fixed on the full archive span, not on the chosen
+        # date window, so changing the dates never invalidates the download cache.
+        exposures = pipeline.select_time_range(exposures, t0, t1)
+        if len(exposures) == 0:
+            raise RuntimeError("no exposures in that time range")
 
-    # --- 2. Download and measure ------------------------------------------
-    cutout_size = fetch_tier(fov_deg)
-    report("downloading", 0, len(exposures))
+        # Footprint pre-check: skip exposures whose detector polygon does not contain target
+        exposures = pipeline.filter_footprint(exposures, target, proper_motion)
+        if len(exposures) == 0:
+            raise RuntimeError("no exposures cover the target footprint")
 
-    def download_progress(done, total):
-        report("downloading", done, total)
+        wanted = set(bands)
+        bands_present = [b for b in pipeline.BANDS
+                         if b in wanted
+                         and any(exposures["energy_bandpassname"] == b)]
+        if not bands_present:
+            raise RuntimeError("no exposures in the selected bands")
 
-    # load_frame prints a line per frame; that is useful in the server log,
-    # and harmless here.
-    report("measuring", 0, len(exposures))
-    frames = pipeline.download_frames(
-        exposures, bands_present, target, reference, cutout_size,
-        max_frames=max_frames, cutout_dir=CUTOUT_ROOT,
-        proper_motion=proper_motion, progress=download_progress,
-        measure_progress=lambda done, total: report("measuring", done, total))
-    if not frames:
-        raise RuntimeError("no cutouts could be retrieved (the archive refused "
-                           "every exposure)")
+        # Safety net: a position near the galactic plane can return thousands of
+        # exposures, and every one is a multi-megabyte download.  Refuse clearly
+        # rather than fill the disk; the user can pick a shorter date range.
+        n_planned = int(sum(np.sum(exposures["energy_bandpassname"] == b)
+                            for b in bands_present))
+        if n_planned > MAX_EXPOSURES:
+            raise RuntimeError(
+                f"{n_planned} exposures match; narrow the date range or pick "
+                f"fewer detectors (limit is {MAX_EXPOSURES})")
 
-    # --- 3. One common north-up grid --------------------------------------
-    report("aligning", 0, len(frames))
-    pipeline.align_frames(frames, reference.ra.deg, reference.dec.deg,
-                          fov_deg=fov_deg, track=track, release_source=True,
-                          aux_planes=False)
-    frames = [f for f in frames if f.image_aligned is not None]
-    if not frames:
-        raise RuntimeError("reproject produced no aligned frames")
+        out_wcs, n = pipeline.north_up_wcs(reference.ra.deg, reference.dec.deg,
+                                           fov_deg)
+        cd = np.asarray(out_wcs.wcs.cd, dtype=float)
+        scale_arcsec = abs(float(cd[0, 0])) * 3600.0
+        cutout_size = fetch_tier(fov_deg)
 
-    # The footprint and the per-frame variance/flags were needed only for the
-    # alignment; dropping them keeps the render phase to one image per frame.
-    for frame in frames:
-        frame.footprint = None
-        frame.variance_aligned = None
-        frame.flags_aligned = None
+        preview_stretch = None
+        # --- Progressive Preview (Phase 4) ------------------------------------
+        # Choose preview band: detector with the most exposures among bands_present
+        band_counts = Counter(exposures["energy_bandpassname"])
+        preview_band = max(bands_present, key=lambda b: band_counts[b])
+        preview_mask = exposures["energy_bandpassname"] == preview_band
+        preview_all_rows = exposures[preview_mask]
+        preview_all_rows = preview_all_rows[np.argsort(np.asarray(preview_all_rows["t_min"], dtype=float))]
 
-    # --- 4. PNGs + manifest ----------------------------------------------
-    report("rendering", 0, len(frames))
-    stretch, entries = render_frames(
-        frames, out_dir, progress=lambda done, total: report("rendering", done, total))
+        # Up to 12 frames evenly spaced across the exposure list, including first and last
+        if len(preview_all_rows) <= 12:
+            preview_rows = preview_all_rows
+        else:
+            indices = np.round(np.linspace(0, len(preview_all_rows) - 1, 12)).astype(int)
+            preview_rows = preview_all_rows[indices]
 
-    out_wcs, n = pipeline.north_up_wcs(reference.ra.deg, reference.dec.deg,
-                                       fov_deg)
-    cd = np.asarray(out_wcs.wcs.cd, dtype=float)
-    scale_arcsec = abs(float(cd[0, 0])) * 3600.0
+        # Check if a partial preview already exists on disk
+        has_partial_manifest = False
+        if manifest_file.exists():
+            try:
+                m = json.loads(manifest_file.read_text())
+                has_partial_manifest = (m.get("preview") is True)
+                if has_partial_manifest and m.get("stretch"):
+                    preview_stretch = {k: (v[0], v[1]) for k, v in m["stretch"].items()}
+            except Exception:
+                pass
 
-    dates = [e["date"] for e in entries]
-    wavelengths = [e["wavelength_um"] for e in entries
-                   if e["wavelength_um"] is not None]
-    manifest = {
-        "version": VERSION,
-        "id": dataset_key,
-        "created_utc": Time.now().iso,
-        "target": {
-            "ra_deg": _num(ra, 6),
-            "dec_deg": _num(dec, 6),
-            "pm_ra_mas_yr": _num(proper_motion[0].to_value(u.mas / u.yr), 2),
-            "pm_dec_mas_yr": _num(proper_motion[1].to_value(u.mas / u.yr), 2),
-        },
-        "request": {
-            "fov_deg": float(fov_deg),
-            "t0": t0,
-            "t1": t1,
-            "bands": bands_present,
-            "track": bool(track),
-            "cutout_size_deg": cutout_size,
-        },
-        "grid": {
-            "n": int(n),
-            "pixel_scale_arcsec": _num(scale_arcsec, 4),
-            "crval": [_num(out_wcs.wcs.crval[0], 7),
-                      _num(out_wcs.wcs.crval[1], 7)],
-            "crpix": [_num(out_wcs.wcs.crpix[0], 3),
-                      _num(out_wcs.wcs.crpix[1], 3)],
-            "cd_deg": [[_num(v, 10) for v in row] for row in cd],
-        },
-        "stretch": stretch,
-        "summary": {
-            "n_frames": len(entries),
-            "n_bands": len({e["band"] for e in entries}),
-            "date_min": min(dates) if dates else None,
-            "date_max": max(dates) if dates else None,
-            "wavelength_min": min(wavelengths) if wavelengths else None,
-            "wavelength_max": max(wavelengths) if wavelengths else None,
-        },
-        "frames": entries,
-    }
+        if not has_partial_manifest and len(preview_rows) > 0:
+            report("downloading", 0, len(preview_rows))
+            preview_frames = pipeline.download_frames(
+                preview_rows, [preview_band], target, reference, cutout_size,
+                cutout_dir=CUTOUT_ROOT, proper_motion=proper_motion,
+                reuse_sizes=FETCH_TIERS_DEG, should_cancel=should_cancel,
+                progress=lambda d, t: report("downloading", d, t),
+                measure_progress=lambda d, t: report("measuring", d, t))
 
-    # Write to a temporary file and rename, so a crash never leaves a
-    # half-written manifest that the server would treat as a finished dataset.
-    tmp = out_dir / "manifest.json.part"
-    tmp.write_text(json.dumps(manifest, indent=1))
-    tmp.replace(out_dir / "manifest.json")
-    return out_dir
+            if preview_frames:
+                report("aligning", 0, len(preview_frames))
+                pipeline.align_frames(preview_frames, reference.ra.deg, reference.dec.deg,
+                                      fov_deg=fov_deg, track=track, release_source=True,
+                                      aux_planes=False, should_cancel=should_cancel)
+                preview_frames = [f for f in preview_frames if f.image_aligned is not None]
+
+                if preview_frames:
+                    report("rendering", 0, len(preview_frames))
+                    preview_stretch_dict, preview_entries = render_frames(
+                        preview_frames, out_dir, subdir="preview",
+                        should_cancel=should_cancel,
+                        progress=lambda d, t: report("rendering", d, t))
+                    if preview_band in preview_stretch_dict:
+                        preview_stretch = {
+                            preview_band: (preview_stretch_dict[preview_band][0],
+                                           preview_stretch_dict[preview_band][1])
+                        }
+
+                    p_dates = [e["date"] for e in preview_entries]
+                    p_wavelengths = [e["wavelength_um"] for e in preview_entries
+                                     if e["wavelength_um"] is not None]
+                    partial_manifest = {
+                        "version": VERSION,
+                        "id": dataset_key,
+                        "complete": False,
+                        "preview": True,
+                        "preview_band": preview_band,
+                        "planned": {"frames": n_planned, "bands": len(bands_present)},
+                        "render_version": "preview",
+                        "created_utc": Time.now().iso,
+                        "target": {
+                            "ra_deg": _num(ra, 6),
+                            "dec_deg": _num(dec, 6),
+                            "pm_ra_mas_yr": _num(proper_motion[0].to_value(u.mas / u.yr), 2),
+                            "pm_dec_mas_yr": _num(proper_motion[1].to_value(u.mas / u.yr), 2),
+                        },
+                        "request": {
+                            "fov_deg": float(fov_deg),
+                            "t0": t0,
+                            "t1": t1,
+                            "bands": bands_present,
+                            "track": bool(track),
+                            "cutout_size_deg": cutout_size,
+                        },
+                        "grid": {
+                            "n": int(n),
+                            "pixel_scale_arcsec": _num(scale_arcsec, 4),
+                            "crval": [_num(out_wcs.wcs.crval[0], 7),
+                                      _num(out_wcs.wcs.crval[1], 7)],
+                            "crpix": [_num(out_wcs.wcs.crpix[0], 3),
+                                      _num(out_wcs.wcs.crpix[1], 3)],
+                            "cd_deg": [[_num(v, 10) for v in row] for row in cd],
+                        },
+                        "stretch": preview_stretch_dict,
+                        "summary": {
+                            "n_frames": len(preview_entries),
+                            "n_bands": 1,
+                            "date_min": min(p_dates) if p_dates else None,
+                            "date_max": max(p_dates) if p_dates else None,
+                            "wavelength_min": min(p_wavelengths) if p_wavelengths else None,
+                            "wavelength_max": max(p_wavelengths) if p_wavelengths else None,
+                        },
+                        "frames": preview_entries,
+                    }
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    tmp = out_dir / "manifest.json.part"
+                    tmp.write_text(json.dumps(partial_manifest, indent=1))
+                    tmp.replace(manifest_file)
+                    report("preview", len(preview_entries), n_planned)
+
+        # --- 2. Full download and measure -------------------------------------
+        report("downloading", 0, len(exposures))
+        frames = pipeline.download_frames(
+            exposures, bands_present, target, reference, cutout_size,
+            max_frames=max_frames, cutout_dir=CUTOUT_ROOT,
+            proper_motion=proper_motion,
+            reuse_sizes=FETCH_TIERS_DEG, should_cancel=should_cancel,
+            progress=lambda d, t: report("downloading", d, t),
+            measure_progress=lambda d, t: report("measuring", d, t))
+
+        if not frames:
+            raise RuntimeError("no cutouts could be retrieved (the archive refused "
+                               "every exposure)")
+
+        # --- 3. One common north-up grid --------------------------------------
+        report("aligning", 0, len(frames))
+        pipeline.align_frames(frames, reference.ra.deg, reference.dec.deg,
+                              fov_deg=fov_deg, track=track, release_source=True,
+                              aux_planes=False, should_cancel=should_cancel)
+        frames = [f for f in frames if f.image_aligned is not None]
+        if not frames:
+            raise RuntimeError("reproject produced no aligned frames")
+
+        # The footprint and the per-frame variance/flags were needed only for the
+        # alignment; dropping them keeps the render phase to one image per frame.
+        for frame in frames:
+            frame.footprint = None
+            frame.variance_aligned = None
+            frame.flags_aligned = None
+
+        # --- 4. PNGs + manifest ----------------------------------------------
+        report("rendering", 0, len(frames))
+        stretch, entries = render_frames(
+            frames, out_dir, subdir="frames",
+            stretch_override=preview_stretch,
+            should_cancel=should_cancel,
+            progress=lambda d, t: report("rendering", done=d, total=t))
+
+        dates = [e["date"] for e in entries]
+        wavelengths = [e["wavelength_um"] for e in entries
+                       if e["wavelength_um"] is not None]
+        manifest = {
+            "version": VERSION,
+            "id": dataset_key,
+            "complete": True,
+            "preview": False,
+            "preview_band": None,
+            "planned": {"frames": len(entries), "bands": len(bands_present)},
+            "render_version": "1",
+            "created_utc": Time.now().iso,
+            "target": {
+                "ra_deg": _num(ra, 6),
+                "dec_deg": _num(dec, 6),
+                "pm_ra_mas_yr": _num(proper_motion[0].to_value(u.mas / u.yr), 2),
+                "pm_dec_mas_yr": _num(proper_motion[1].to_value(u.mas / u.yr), 2),
+            },
+            "request": {
+                "fov_deg": float(fov_deg),
+                "t0": t0,
+                "t1": t1,
+                "bands": bands_present,
+                "track": bool(track),
+                "cutout_size_deg": cutout_size,
+            },
+            "grid": {
+                "n": int(n),
+                "pixel_scale_arcsec": _num(scale_arcsec, 4),
+                "crval": [_num(out_wcs.wcs.crval[0], 7),
+                          _num(out_wcs.wcs.crval[1], 7)],
+                "crpix": [_num(out_wcs.wcs.crpix[0], 3),
+                          _num(out_wcs.wcs.crpix[1], 3)],
+                "cd_deg": [[_num(v, 10) for v in row] for row in cd],
+            },
+            "stretch": stretch,
+            "summary": {
+                "n_frames": len(entries),
+                "n_bands": len({e["band"] for e in entries}),
+                "date_min": min(dates) if dates else None,
+                "date_max": max(dates) if dates else None,
+                "wavelength_min": min(wavelengths) if wavelengths else None,
+                "wavelength_max": max(wavelengths) if wavelengths else None,
+            },
+            "frames": entries,
+        }
+
+        # Write to a temporary file and rename, so a crash never leaves a
+        # half-written manifest that the server would treat as a finished dataset.
+        tmp = out_dir / "manifest.json.part"
+        tmp.write_text(json.dumps(manifest, indent=1))
+        tmp.replace(manifest_file)
+
+        # Remove preview directory after final manifest is in place
+        preview_dir = out_dir / "preview"
+        if preview_dir.exists():
+            shutil.rmtree(preview_dir, ignore_errors=True)
+
+        return out_dir
+    except pipeline.BuildCancelled:
+        # Keep partial preview if one exists; otherwise clean up incomplete dataset
+        if not manifest_file.exists():
+            remove_dataset(dataset_key)
+        raise
 
 
 def remove_dataset(dataset: str):
