@@ -1,0 +1,11 @@
+.git
+.venv
+__pycache__
+*.py[cod]
+.ipynb_checkpoints
+.jupyter
+.jupyter_ystore.db
+cutout_cache
+data
+*.png
+*.ecsv

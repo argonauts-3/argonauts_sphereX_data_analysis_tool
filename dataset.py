@@ -30,10 +30,9 @@ from PIL import Image
 
 import test as pipeline
 
-# Bump this when the manifest schema or the rendering changes.  It is part of
-# the dataset id, so old directories are simply ignored instead of being
-# served with a new page that expects different fields.
-VERSION = 2
+# Bump this when the pipeline, manifest schema or rendering changes.  It is
+# part of the dataset id, so results made with old pipeline logic are ignored.
+VERSION = 3
 
 REPO = Path(__file__).resolve().parent
 DATA_ROOT = REPO / "data"
@@ -357,7 +356,8 @@ def build_dataset(ra_deg, dec_deg, dataset_key, fov_deg, t0, t1, bands,
                             "fov_deg": float(fov_deg),
                             "t0": t0,
                             "t1": t1,
-                            "bands": bands_present,
+                            "bands": list(bands),
+                            "bands_present": bands_present,
                             "track": bool(track),
                             "cutout_size_deg": cutout_size,
                         },
@@ -447,7 +447,8 @@ def build_dataset(ra_deg, dec_deg, dataset_key, fov_deg, t0, t1, bands,
                 "fov_deg": float(fov_deg),
                 "t0": t0,
                 "t1": t1,
-                "bands": bands_present,
+                "bands": list(bands),
+                "bands_present": bands_present,
                 "track": bool(track),
                 "cutout_size_deg": cutout_size,
             },

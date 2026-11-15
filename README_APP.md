@@ -6,6 +6,8 @@ each one, aligns them all onto the same north-up grid, and lets you blink
 through them.  There is also an A-B / (A+B)/2 view for comparing two epochs.
 
 For the complete in-depth user and developer walkthrough, see [GUIDE.md](GUIDE.md).
+For a plain-language explanation of archive retrieval and data processing, see
+[PROCESSING.md](PROCESSING.md).
 For a dated snapshot of what is built, what is cached and what remains, see `PROGRESS.md`.
 
 ## Run it
@@ -34,6 +36,76 @@ the risk of more archive retries:
 ```bash
 SPHEREX_DOWNLOAD_WORKERS=16 .venv/bin/python app.py
 ```
+
+## Run with Docker
+
+Docker provides the same Python environment on Linux, macOS, and Windows.
+You need Docker Engine and Docker Compose v2 (`docker compose`, with a space).
+
+### Install and check Docker
+
+- **macOS or Windows:** Install and start Docker Desktop. Compose v2 is
+  included. Wait until Docker Desktop reports that its engine is running.
+- **Ubuntu/Linux:** Install Docker Engine and the Compose v2 plugin. Follow
+  Docker's [Ubuntu Engine installation instructions](https://docs.docker.com/engine/install/ubuntu/)
+  if Docker Engine is not installed yet. Then install the Compose package for
+  the same apt repository as Docker:
+
+  ```sh
+  # Ubuntu's Docker packages:
+  sudo apt update && sudo apt install docker-compose-v2
+
+  # Or, if Docker came from Docker's apt repository:
+  sudo apt update && sudo apt install docker-compose-plugin
+  ```
+
+  Start the daemon if needed with `sudo systemctl enable --now docker`.
+
+Check both commands before continuing:
+
+```sh
+docker --version
+docker compose version
+```
+
+On Linux, if `docker compose version` says `unknown command`, install the
+Compose v2 package for the repository you used to install Docker. If Docker
+commands fail with permission denied on `/var/run/docker.sock`, first confirm
+the daemon works with `sudo docker info`. You can run this app once with
+`sudo docker compose up --build`. To use Docker without `sudo` in future,
+add your account to the `docker` group:
+
+```sh
+sudo usermod -aG docker "$USER"
+```
+
+If the `docker` group does not exist, create it first with
+`sudo groupadd docker`. Then sign out of your Linux desktop session completely
+and sign in again.
+Verify access with `docker info`. **Membership in the `docker` group grants
+root-level control of the computer.** See Docker's
+[Linux post-installation guide](https://docs.docker.com/engine/install/linux-postinstall/)
+for details and the rootless alternative.
+
+### Build and run the app
+
+From the repository directory, run:
+
+```sh
+docker compose up --build
+```
+
+Then open <http://127.0.0.1:5000>. Stop the app with `Ctrl+C`; run
+`docker compose down` to stop it later. The `data/` and `cutout_cache/`
+directories are mounted from the host, so datasets and downloaded cutouts
+persist across container rebuilds. These caches can grow substantially.
+
+The first build downloads Python dependencies and needs an internet connection.
+Building a dataset also downloads observations from the SPHEREx archive. To
+change the host port, edit the `5000:5000` mapping in `compose.yaml`.
+
+If you started the stack in the background with `docker compose up -d`, view
+logs with `docker compose logs -f` and stop it with `docker compose down`.
 
 Everything is cached afterwards:
 

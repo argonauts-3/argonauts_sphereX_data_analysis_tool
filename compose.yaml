@@ -1,0 +1,9 @@
+services:
+  spherex:
+    build: .
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./data:/app/data
+      - ./cutout_cache:/app/cutout_cache
+    restart: unless-stopped

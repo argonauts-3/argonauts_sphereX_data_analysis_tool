@@ -169,20 +169,39 @@ def parse_s_region_polygon(s_region: str) -> Optional[np.ndarray]:
 def footprint_contains_target(s_region: str, target_pos: SkyCoord) -> bool:
     """True if target_pos falls inside the exposure's s_region polygon.
 
-    Projected into a local tangent plane to avoid RA wrap near 0/360.
-    Fails open (returns True) if s_region is missing or unparseable.
+    A gnomonic projection avoids both RA wrap and the severe distortion of a
+    linear RA/Dec approximation near the celestial poles.  Detector footprint
+    edges in the archive's polygon are great-circle arcs, which project to
+    straight lines in this plane.  Fails open if s_region is missing or
+    unparseable.
     """
     poly = parse_s_region_polygon(s_region)
     if poly is None:
         return True
     from matplotlib.path import Path as MplPath
 
-    ra0 = target_pos.ra.deg
-    dec0 = target_pos.dec.deg
-    dec0_rad = np.radians(dec0)
-    dra = (poly[:, 0] - ra0 + 180.0) % 360.0 - 180.0
-    x = dra * np.cos(dec0_rad)
-    y = poly[:, 1] - dec0
+    ra0 = target_pos.ra.to_value(u.rad)
+    dec0 = target_pos.dec.to_value(u.rad)
+    ra = np.radians(poly[:, 0])
+    dec = np.radians(poly[:, 1])
+    dra = (ra - ra0 + np.pi) % (2.0 * np.pi) - np.pi
+
+    sin_dec0 = np.sin(dec0)
+    cos_dec0 = np.cos(dec0)
+    sin_dec = np.sin(dec)
+    cos_dec = np.cos(dec)
+    cos_dra = np.cos(dra)
+    denominator = sin_dec0 * sin_dec + cos_dec0 * cos_dec * cos_dra
+
+    # The gnomonic projection is defined only in the target's visible
+    # hemisphere.  SIA returns small detector footprints around the search
+    # position, but fail closed if a malformed/distant polygon violates that
+    # assumption rather than projecting across infinity.
+    if np.any(denominator <= 0.0):
+        return False
+
+    x = cos_dec * np.sin(dra) / denominator
+    y = (cos_dec0 * sin_dec - sin_dec0 * cos_dec * cos_dra) / denominator
     path = MplPath(np.column_stack([x, y]))
     return bool(path.contains_point((0.0, 0.0)))
 

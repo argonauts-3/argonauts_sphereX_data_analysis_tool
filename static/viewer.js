@@ -1,17 +1,8 @@
-/* Canvas frame viewer with selectable interpolation.
+/* Canvas frame viewer with selectable interpolation and color mode.
  *
  * The server renders 8-bit PNGs.  This module scales them to the stage with
- * one of five display kernels:
- *
- *   nearest   hard pixel edges (best for inspecting individual pixels)
- *   bilinear  smooth, cheap, no ringing
- *   bicubic   4x4 Catmull-Rom; sharper, slight overshoot
- *   lanczos   6x6 Lanczos3; sharpest, can ring around bright stars
- *   gaussian  5x5 Gaussian; soft, no ringing
- *
- * Interpolation is display-only: the PNG, the manifest and every measured
- * value are unchanged.  WebGL gives exact kernels; a plain 2D canvas is used
- * as a fallback and supports only nearest and smooth (bilinear) scaling.
+ * one of five display kernels and supports switching between Grayscale and
+ * Colour (Viridis).
  *
  * No dependencies, no build step.
  */
@@ -19,11 +10,13 @@
 "use strict";
 
 const FRAME_KERNELS = ["nearest", "bilinear", "bicubic", "lanczos", "gaussian"];
+const FRAME_COLOR_MODES = ["grayscale", "colour"];
 
 function createFrameViewer(canvas, options = {}) {
   const defaultKernel = FRAME_KERNELS.includes(options.defaultKernel)
     ? options.defaultKernel
     : "bilinear";
+  const defaultColorMode = options.defaultColorMode || "colour";
   const force2d = Boolean(options.force2d);
 
   let mode = "none";                 // "webgl" | "2d" | "none"
@@ -35,6 +28,7 @@ function createFrameViewer(canvas, options = {}) {
   let ctx2d = null;
   let textureSize = [1, 1];
   let kernel = defaultKernel;
+  let colorMode = defaultColorMode;
   let currentImage = null;
   let requestToken = 0;
   let destroyed = false;
@@ -56,6 +50,7 @@ function createFrameViewer(canvas, options = {}) {
 
     uniform sampler2D uTex;
     uniform int uKernel;
+    uniform int uColorMode;
     uniform vec2 uTexSize;
     uniform float uBlack;
     uniform float uWhite;
@@ -86,8 +81,19 @@ function createFrameViewer(canvas, options = {}) {
     }
 
     float gaussianWeight(float x) {
-      // sigma = 1.2 texels: visibly soft without turning stars into blobs.
       return exp(-0.5 * x * x / 1.44);
+    }
+
+    vec3 viridis(float t) {
+      const vec3 c0 = vec3(0.2772, 0.0054, 0.3366);
+      const vec3 c1 = vec3(0.1050, 1.4039, 0.4578);
+      const vec3 c2 = vec3(-1.3688, 0.2858, -0.9857);
+      const vec3 c3 = vec3(1.4259, -1.8483, 1.0560);
+      const vec3 c4 = vec3(-0.5501, 0.8290, -0.3275);
+      float t2 = t * t;
+      float t3 = t2 * t;
+      float t4 = t3 * t;
+      return clamp(c0 + c1*t + c2*t2 + c3*t3 + c4*t4, 0.0, 1.0);
     }
 
     vec4 sampleTexel(vec2 texel) {
@@ -146,9 +152,16 @@ function createFrameViewer(canvas, options = {}) {
         color = sum / total;
       }
 
-      // Black / white point.  (0, 1) leaves the image unchanged.
-      vec3 leveled = clamp((color.rgb - vec3(uBlack)) / max(uWhite - uBlack, 1.0e-4), 0.0, 1.0);
-      gl_FragColor = vec4(leveled, 1.0);
+      float val = clamp((color.r - uBlack) / max(uWhite - uBlack, 1.0e-4), 0.0, 1.0);
+
+      vec3 finalColor;
+      if (uColorMode == 1) {
+        finalColor = viridis(val);
+      } else {
+        finalColor = vec3(val);
+      }
+
+      gl_FragColor = vec4(finalColor, 1.0);
     }
   `;
 
@@ -210,6 +223,7 @@ function createFrameViewer(canvas, options = {}) {
     uniforms = {
       texture: gl.getUniformLocation(program, "uTex"),
       kernel: gl.getUniformLocation(program, "uKernel"),
+      colorMode: gl.getUniformLocation(program, "uColorMode"),
       size: gl.getUniformLocation(program, "uTexSize"),
       black: gl.getUniformLocation(program, "uBlack"),
       white: gl.getUniformLocation(program, "uWhite"),
@@ -239,7 +253,6 @@ function createFrameViewer(canvas, options = {}) {
   }
 
   canvas.addEventListener("webglcontextlost", event => {
-    // Without preventDefault() the context is never restored.
     event.preventDefault();
     gl = null;
   });
@@ -290,6 +303,7 @@ function createFrameViewer(canvas, options = {}) {
       gl.uniform1i(uniforms.texture, 0);
       gl.uniform1i(uniforms.kernel, FRAME_KERNELS.indexOf(kernel));
       gl.uniform2f(uniforms.size, textureSize[0], textureSize[1]);
+      gl.uniform1i(uniforms.colorMode, colorMode === "colour" ? 1 : 0);
       gl.uniform1f(uniforms.black, levels[0]);
       gl.uniform1f(uniforms.white, levels[1]);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
@@ -298,12 +312,10 @@ function createFrameViewer(canvas, options = {}) {
 
     ctx2d.clearRect(0, 0, width, height);
     if (!currentImage) return;
-    // A 2D canvas only offers nearest or browser-smoothed scaling.  The page
-    // disables the other menu entries when this fallback is active.
     ctx2d.imageSmoothingEnabled = kernel !== "nearest";
     ctx2d.imageSmoothingQuality = "high";
     ctx2d.drawImage(currentImage, 0, 0, width, height);
-    if (levels[0] > 0 || levels[1] < 1) applyLevels2d(width, height);
+    if (levels[0] > 0 || levels[1] < 1 || colorMode === "colour") applyLevels2d(width, height);
   }
 
   function supports(name) {
@@ -319,7 +331,13 @@ function createFrameViewer(canvas, options = {}) {
     return true;
   }
 
-  /** 2D fallback: apply the black / white point to the drawn pixels. */
+  function setColorMode(modeName) {
+    if (!FRAME_COLOR_MODES.includes(modeName)) return false;
+    colorMode = modeName;
+    draw();
+    return true;
+  }
+
   function applyLevels2d(width, height) {
     let data;
     try {
@@ -328,23 +346,31 @@ function createFrameViewer(canvas, options = {}) {
       return;
     }
     const span = Math.max(levels[1] - levels[0], 1e-4);
-    const lut = new Uint8ClampedArray(256);
+    const lut = new Uint8ClampedArray(256 * 3);
+
     for (let v = 0; v < 256; v++) {
-      lut[v] = Math.round(255 * Math.min(Math.max((v / 255 - levels[0]) / span, 0), 1));
+      let t = Math.min(Math.max((v / 255 - levels[0]) / span, 0), 1);
+      if (colorMode === "colour") {
+        lut[v * 3]     = Math.round(255 * Math.min(Math.max(0.2772 + t*(1.050 + t*(-1.3688 + t*(1.4259 - 0.5501*t))), 0), 1));
+        lut[v * 3 + 1] = Math.round(255 * Math.min(Math.max(0.0054 + t*(1.4039 + t*(0.2858 + t*(-1.8483 + 0.8290*t))), 0), 1));
+        lut[v * 3 + 2] = Math.round(255 * Math.min(Math.max(0.3366 + t*(0.4578 + t*(-0.9857 + t*(1.0560 - 0.3275*t))), 0), 1));
+      } else {
+        let val = Math.round(255 * t);
+        lut[v * 3]     = val;
+        lut[v * 3 + 1] = val;
+        lut[v * 3 + 2] = val;
+      }
     }
     const px = data.data;
     for (let i = 0; i < px.length; i += 4) {
-      px[i] = lut[px[i]];
-      px[i + 1] = lut[px[i + 1]];
-      px[i + 2] = lut[px[i + 2]];
+      let idx = px[i];
+      px[i]     = lut[idx * 3];
+      px[i + 1] = lut[idx * 3 + 1];
+      px[i + 2] = lut[idx * 3 + 2];
     }
     ctx2d.putImageData(data, 0, 0);
   }
 
-  /**
-   * Black and white point as texture values (0 = black, 1 = white).  The app
-   * passes (0, 1) for difference images so they keep their own stretch.
-   */
   function setLevels(black, white) {
     const b = Math.min(Math.max(Number(black), 0), 1);
     const w = Math.min(Math.max(Number(white), 0), 1);
@@ -425,12 +451,14 @@ function createFrameViewer(canvas, options = {}) {
   return {
     get mode() { return mode; },
     get kernel() { return kernel; },
+    get colorMode() { return colorMode; },
     get levels() { return [...levels]; },
     get supportedKernels() {
       return mode === "webgl" ? [...FRAME_KERNELS] : ["nearest", "bilinear"];
     },
     supports,
     setKernel,
+    setColorMode,
     setLevels,
     show,
     showURL,

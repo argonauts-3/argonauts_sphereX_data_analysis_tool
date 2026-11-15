@@ -5,3 +5,4 @@ requests>=2.31
 Pillow>=10.0
 reproject>=0.13
 matplotlib>=3.8
+waitress>=3.0

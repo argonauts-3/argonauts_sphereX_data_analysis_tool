@@ -227,6 +227,12 @@ function wireControls() {
     }
     markDirty();
   });
+  
+  $("colorModeSelect").addEventListener("change", () => {
+    state.viewer.setColorMode($("colorModeSelect").value);
+    updateColorbar(); // Refresh the colorbar gradient and tick labels
+    syncURL();
+  });
 
   // Typing a name or coordinate is itself a change to the request.
   $("nameInput").addEventListener("input", () => {
@@ -481,7 +487,7 @@ function fillForm(params) {
     $("nameInput").value = params.name || "";
     $("raInput").value = Number.isFinite(params.ra) ? params.ra : "";
     $("decInput").value = Number.isFinite(params.dec) ? params.dec : "";
-  }
+  } 
 
   SliderControls.get("fov")?.setValue(params.fov ?? 0.3, { silent: true });
   SliderControls.get("fps")?.setValue(state.fps, { silent: true });
@@ -1195,6 +1201,7 @@ function applyLevelsToView() {
 
 function updateColorbar() {
   const bar = $("colorbar");
+  const cbBar = $("cbBar"); // Reference to the colorbar gradient element
   const frame = state.frames[state.index];
   const stretch = frame ? state.manifest?.stretch?.[frame.band] : null;
   const ok = state.mode === "movie" && Array.isArray(stretch) &&
@@ -1207,16 +1214,25 @@ function updateColorbar() {
   }
   bar.hidden = false;
 
-  const key = `${frame.band}|${state.levels.black}|${state.levels.white}`;
+  // Include colorMode in the cache key so it updates if the palette changes
+  const colorMode = state.viewer?.colorMode || "colour";
+  const key = `${frame.band}|${state.levels.black}|${state.levels.white}|${colorMode}`;
   if (key === state.colorbarKey) return;
   state.colorbarKey = key;
+
+  // Update gradient based on active color mode
+  if (colorMode === "colour") {
+    // Viridis gradient stops matching the shader approximation
+    cbBar.style.background = "linear-gradient(to right, #440154, #3b528b, #21918c, #5ec962, #fde725)";
+  } else {
+    cbBar.style.background = "linear-gradient(to right, #000, #fff)";
+  }
 
   const [lo, hi] = stretch;
   const span = hi - lo;
   const from = lo + state.levels.black * span;
   const to = lo + state.levels.white * span;
-  // Enough decimals that neighbouring ticks (a quarter of the range apart)
-  // still differ in their second significant digit.
+  
   const decimals = Math.min(6, Math.max(0, Math.ceil(-Math.log10((to - from) / 4)) + 1));
   const ticks = $("cbTicks").children;
   for (let k = 0; k < ticks.length; k++) {
@@ -1245,7 +1261,11 @@ function readViewStateFromQuery(query) {
     SliderControls.get("white")?.setValue(white, { silent: true });
     state.levels = { black: black / 100, white: white / 100 };
   }
-
+  const colormode = query.get("color") || query.get("colormode");
+  if (colormode && ["grayscale", "colour"].includes(colormode)) {
+    state.viewer.setColorMode(colormode);
+    $("colorModeSelect").value = colormode;
+  }
   const w0 = number("wl0");
   const w1 = number("wl1");
   if (w0 !== null && w1 !== null && w1 >= w0) state.filter.wl = [w0, w1];
@@ -1536,6 +1556,9 @@ function syncURL() {
   params.set("fov", state.params.fov);
   if (state.params.t0) params.set("t0", state.params.t0);
   if (state.params.t1) params.set("t1", state.params.t1);
+  if (state.viewer && state.viewer.colorMode) {
+    params.set("color", state.viewer.colorMode);
+  }
   params.set("bands", state.params.bands.map(b => BAND_SHORT[b]).join(","));
   if (state.params.track) params.set("track", "1");
   params.set("fps", state.fps);
