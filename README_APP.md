@@ -126,6 +126,12 @@ are rebuilt instead of being served with a page that expects something else.
 - **Difference images are only allowed within one detector.**  D1 and D5 are
   different wavelengths and different PSFs; subtracting them is not a
   difference image.  The endpoint refuses cross-band pairs.
+- **Not every archive row becomes a frame.**  An exposure can intersect the
+  72" SIA search circle while the target itself falls just outside the
+  detector.  The archive then returns a thin edge cutout that does not contain
+  the target, and the pipeline skips it.  At WISE 0855 that leaves 258 usable
+  frames out of 272 archive rows; the table and manifest list only frames that
+  really have the target on a pixel.
 - **A one-year baseline is short for motion.**  At 6.16 arcsec/pixel, Barnard's
   Star moves 1.7 pixels per year and WISE 0855 moves 1.3.  Motion appears as a
   small dipole in A-B, not as a visible streak.  The app is better at
