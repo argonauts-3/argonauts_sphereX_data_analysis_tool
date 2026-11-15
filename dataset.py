@@ -272,7 +272,8 @@ def build_dataset(ra_deg, dec_deg, dataset_key, fov_deg, t0, t1, bands,
     # --- 3. One common north-up grid --------------------------------------
     report("aligning", 0, len(frames))
     pipeline.align_frames(frames, reference.ra.deg, reference.dec.deg,
-                          fov_deg=fov_deg, track=track, release_source=True)
+                          fov_deg=fov_deg, track=track, release_source=True,
+                          aux_planes=False)
     frames = [f for f in frames if f.image_aligned is not None]
     if not frames:
         raise RuntimeError("reproject produced no aligned frames")

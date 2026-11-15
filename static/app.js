@@ -77,7 +77,11 @@ async function init() {
   const params = paramsFromQuery(query);
   if (params) {
     fillForm(params);
-    startBuild(params);
+    // Use the form rather than the raw URL: fillForm may have matched a
+    // curated target and filled in its coordinates.  That avoids a pointless
+    // Sesame lookup and makes name-only links work for names like
+    // "WISE 0855-0714" that Sesame does not recognise.
+    startBuild(requestFromForm());
   } else {
     const first = state.targets[0];
     if (!first) {
@@ -139,15 +143,35 @@ function wireControls() {
   $("targetSelect").addEventListener("change", () => {
     const name = $("targetSelect").value;
     if (name === "custom") {
-      $("nameInput").disabled = false;
-      $("raInput").disabled = false;
-      $("decInput").disabled = false;
+      // The name and coordinate fields are always editable; this option just
+      // makes it explicit that the next build should use them.
       $("nameInput").focus();
     } else {
       selectTarget(name);
       applyForm();
     }
   });
+
+  // Typing a name or coordinate is itself a request for a custom target.
+  $("nameInput").addEventListener("input", () => {
+    useCustomTarget();
+    // A new name means a new position.  Clearing the old coordinates stops
+    // them from silently overriding the name the user just typed.
+    $("raInput").value = "";
+    $("decInput").value = "";
+  });
+
+  for (const id of ["raInput", "decInput"]) {
+    $(id).addEventListener("input", () => {
+      useCustomTarget();
+      // If the name came from the drop-down, it no longer describes these
+      // coordinates.  Keep a label the user typed themselves.
+      const name = $("nameInput").value.trim();
+      if (state.targets.some(target => target.name === name)) {
+        $("nameInput").value = "";
+      }
+    });
+  }
 
   linkPair("fovRange", "fovNumber", () => applyForm());
   linkPair("fpsRange", "fpsNumber", value => {
@@ -212,16 +236,19 @@ function wireControls() {
   });
 }
 
+function useCustomTarget() {
+  if ($("targetSelect").value !== "custom") {
+    $("targetSelect").value = "custom";
+  }
+}
+
 function selectTarget(name) {
   const target = state.targets.find(t => t.name === name);
   if (!target) return;
   $("targetSelect").value = target.name;
   $("nameInput").value = target.name;
-  $("nameInput").disabled = true;
   $("raInput").value = target.ra.toFixed(6);
   $("decInput").value = target.dec.toFixed(6);
-  $("raInput").disabled = true;
-  $("decInput").disabled = true;
 }
 
 function requestFromForm() {
@@ -248,10 +275,14 @@ function requestFromForm() {
     const name = $("nameInput").value.trim();
     const ra = parseFloat($("raInput").value);
     const dec = parseFloat($("decInput").value);
-    if (Number.isFinite(ra) && Number.isFinite(dec)) {
+    const hasRa = Number.isFinite(ra);
+    const hasDec = Number.isFinite(dec);
+    if (hasRa && hasDec) {
       request.name = name || "custom field";
       request.ra = ra;
       request.dec = dec;
+    } else if (hasRa || hasDec) {
+      throw new Error("Enter both RA and Dec, or use a target name.");
     } else if (name) {
       // The server resolves the name with Sesame and returns the coordinates.
       request.name = name;
@@ -271,9 +302,6 @@ function fillForm(params) {
     selectTarget(curated.name);
   } else {
     $("targetSelect").value = "custom";
-    $("nameInput").disabled = false;
-    $("raInput").disabled = false;
-    $("decInput").disabled = false;
     $("nameInput").value = params.name || "";
     $("raInput").value = Number.isFinite(params.ra) ? params.ra : "";
     $("decInput").value = Number.isFinite(params.dec) ? params.dec : "";
@@ -402,15 +430,23 @@ async function loadDataset(id, token) {
   $("frameRange").max = Math.max(0, manifest.frames.length - 1);
   $("frameNumber").max = Math.max(0, manifest.frames.length - 1);
 
+  // Show a frame immediately, then load the rest in the background.  Waiting
+  // for all 258 PNGs before drawing made the page feel much slower than it is.
+  const wanted = state.wantFrame;
+  state.wantFrame = null;
+  const total = manifest.frames.length;
+  setIndex(Number.isInteger(wanted) && wanted >= 0 && wanted < total ? wanted : 0);
+  showProgress(`Loading images (0/${total})`, 0);
+
   // Load every PNG once.  Blinking afterwards is then a pure swap with no
   // network request, which is what makes the movie smooth.
   let loaded = 0;
-  const total = manifest.frames.length;
   await Promise.all(manifest.frames.map(frame => new Promise(resolve => {
     const image = new Image();
     const done = () => {
       loaded += 1;
-      if (loaded % 8 === 0 || loaded === total) {
+      if (token === state.buildToken &&
+          (loaded % 8 === 0 || loaded === total)) {
         showProgress(`Loading images (${loaded}/${total})`, loaded / total);
       }
       resolve();
@@ -422,10 +458,6 @@ async function loadDataset(id, token) {
   if (token !== state.buildToken) return;
 
   hideProgress();
-  const wanted = state.wantFrame;
-  state.wantFrame = null;
-  setIndex(Number.isInteger(wanted) && wanted >= 0 && wanted < total ? wanted : 0);
-
   if (state.wantPlay) {
     state.wantPlay = false;
     play();

@@ -98,6 +98,22 @@ TARGETS = [
 app = Flask(__name__, static_folder=str(STATIC), static_url_path="/static")
 
 
+@app.after_request
+def cache_immutable_files(response):
+    """Let the browser keep dataset files forever.
+
+    A dataset id is a hash of the request, so `/data/<id>/...` never changes
+    once it exists.  The same is true of a difference image for a given pair
+    of frames.  Only successful responses are marked cacheable: a 404 while a
+    build is still running must not stick in the browser cache.
+    """
+    if response.status_code == 200 and (
+            request.path.startswith("/data/")
+            or request.path.startswith("/api/diff/")):
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    return response
+
+
 # ==========================================================================
 # Request parsing
 # ==========================================================================
@@ -135,13 +151,19 @@ def parse_build_request(data):
     dec = data.get("dec")
 
     if ra is None or dec is None:
-        if not name:
-            raise ValueError("give a target name or ra/dec")
-        coord = pipeline.resolve_name(name)
-        ra_deg, dec_deg = float(coord.ra.deg), float(coord.dec.deg)
+        # Check the curated list before Sesame: its display names are not
+        # always resolvable there ("WISE 0855-0714" vs the canonical
+        # "WISE J085510.83-071442.5"), and we already know the coordinates.
         curated = next(
             (t for t in TARGETS if t["query"].lower() == name.lower()
              or t["name"].lower() == name.lower()), None)
+        if curated:
+            ra_deg, dec_deg = curated["ra"], curated["dec"]
+        else:
+            if not name:
+                raise ValueError("give a target name or ra/dec")
+            coord = pipeline.resolve_name(name)
+            ra_deg, dec_deg = float(coord.ra.deg), float(coord.dec.deg)
     else:
         try:
             ra_deg, dec_deg = float(ra), float(dec)

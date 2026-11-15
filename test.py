@@ -44,6 +44,7 @@ Flags           Each pixel carries a number whose bits mark problems
 
 import hashlib
 import io
+import os
 import sys
 import time
 import warnings
@@ -111,7 +112,9 @@ MAX_FRAMES_PER_BAND = None
 # Downloads are pure waiting (1-3 s per file), so a few threads make the run
 # several times faster without touching the measurement code.  Keep it modest:
 # the archive starts answering 503 if you hammer it with too many at once.
-DOWNLOAD_WORKERS = 8
+# A local demo can try `SPHEREX_DOWNLOAD_WORKERS=16`; the build retries 502/503
+# downloads, so pushing too hard costs more in retries than it saves.
+DOWNLOAD_WORKERS = int(os.environ.get("SPHEREX_DOWNLOAD_WORKERS", "8"))
 
 # The six SPHEREx detectors.
 BANDS = ("SPHEREx-D1", "SPHEREx-D2", "SPHEREx-D3",
@@ -822,7 +825,7 @@ def shifted_wcs(wcs, shift_ra_deg, shift_dec_deg):
 
 
 def align_frames(frames, ra, dec, fov_deg=None, track=True,
-                 release_source=False):
+                 release_source=False, aux_planes=True):
     """Resample every frame onto one common grid (stored in frame.*_aligned).
 
     `track=True` shifts each frame so the moving target stays at the centre.
@@ -832,6 +835,10 @@ def align_frames(frames, ra, dec, fov_deg=None, track=True,
     `release_source=True` drops the full cutout arrays after each frame has
     been reprojected.  The web app renders from `image_aligned` only, so this
     keeps a 272-exposure build from holding two copies of every cutout.
+
+    `aux_planes=False` also skips the aligned variance and flags.  They are
+    useful for the command-line quality checks, but the web app never reads
+    them, and reprojecting them triples the alignment time.
     """
     fov_deg = FIELD_OF_VIEW_DEG if fov_deg is None else fov_deg
     out_wcs, n = north_up_wcs(ra, dec, fov_deg)
@@ -845,12 +852,15 @@ def align_frames(frames, ra, dec, fov_deg=None, track=True,
 
         frame.image_aligned, frame.footprint = reproject_interp(
             (frame.image, wcs), out_wcs, shape_out=(n, n))
-        frame.variance_aligned, _ = reproject_interp(
-            (frame.variance, wcs), out_wcs, shape_out=(n, n))
-        flags_float, _ = reproject_interp(
-            (frame.flags, wcs), out_wcs, shape_out=(n, n), order="nearest-neighbor")
-        # Pixels outside the footprint are NaN, which would cast to garbage.
-        frame.flags_aligned = np.nan_to_num(flags_float, nan=0.0).round().astype(np.int32)
+
+        if aux_planes:
+            frame.variance_aligned, _ = reproject_interp(
+                (frame.variance, wcs), out_wcs, shape_out=(n, n))
+            flags_float, _ = reproject_interp(
+                (frame.flags, wcs), out_wcs, shape_out=(n, n),
+                order="nearest-neighbor")
+            # Pixels outside the footprint are NaN, which would cast to garbage.
+            frame.flags_aligned = np.nan_to_num(flags_float, nan=0.0).round().astype(np.int32)
 
         if release_source:
             frame.image = None

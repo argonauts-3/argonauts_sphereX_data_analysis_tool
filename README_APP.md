@@ -25,7 +25,17 @@ PORT=8080 HOST=0.0.0.0 .venv/bin/python app.py
 The first visit to a new position downloads one cutout per exposure.  At the
 default 0.3 degree field that is about 1.3 GB and 10-20 minutes on a slow
 link; the page shows progress.  Larger fields cost more: about 4.5 GB at 1.0
-degree.  Everything is cached afterwards:
+degree.  The page draws the first frame as soon as the manifest arrives and
+preloads the rest in the background.
+
+Downloads use 8 threads by default.  On a fast link you can ask for more, at
+the risk of more archive retries:
+
+```bash
+SPHEREX_DOWNLOAD_WORKERS=16 .venv/bin/python app.py
+```
+
+Everything is cached afterwards:
 
 - `cutout_cache/` - the archive cutouts, keyed by the cutout URL.  Shared by
   the app and `test.py`, and reused when you change the date range.
@@ -33,11 +43,17 @@ degree.  Everything is cached afterwards:
   Changing the dates rebuilds this from the cache in a few seconds.  Changing
   the field of view does too, as long as the new field still fits inside the
   same downloaded cutout size (the tiers are 0.3, 0.5, 0.8, 1.0 and 1.5
-  degrees).
+  degrees).  Frame PNGs and difference images are sent with a one-year
+  `Cache-Control`, so revisiting a dataset does not download them again.
 
 ## The page
 
-- Target drop-down with five curated objects, or any name / RA / Dec.
+- Target drop-down with five curated objects, or any name / RA / Dec.  The
+  name and coordinate fields are always editable: typing in them switches the
+  drop-down to "custom", and typing a new name clears the old coordinates so
+  they cannot silently override it.  A custom name with no coordinates is
+  resolved by the server through Sesame; the five curated names use the
+  coordinates already in the target list.
 - Field of view from 0.1 to 1.0 degrees.  Slider and number box are linked.
   The frames are always 6.16 arcsec/pixel, so a larger field shows more sky,
   not more detail.
@@ -61,7 +77,7 @@ The current view is always in the URL, so it can be shared or embedded:
 
 | parameter | meaning |
 |---|---|
-| `name` | target name (resolved with Sesame) |
+| `name` | target name; curated names use their built-in coordinates, others are resolved with Sesame |
 | `ra`, `dec` | J2000 coordinates in degrees (take precedence over `name`) |
 | `fov` | field of view in degrees, 0.1 to 1.0 |
 | `t0`, `t1` | ISO dates, inclusive |
