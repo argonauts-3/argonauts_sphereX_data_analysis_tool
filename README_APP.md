@@ -115,8 +115,10 @@ Everything is cached afterwards:
   Changing the dates rebuilds this from the cache in a few seconds.  Changing
   the field of view does too, as long as the new field still fits inside the
   same downloaded cutout size (the tiers are 0.3, 0.5, 0.8, 1.0 and 1.5
-  degrees).  Frame PNGs and difference images are sent with a one-year
-  `Cache-Control`, so revisiting a dataset does not download them again.
+  degrees). Stack results are saved below `data/<id>/stacks/<stack-id>/` and
+  identical stack selections reuse the saved results. Frame, comparison, and
+  stack display PNGs are sent with a one-year `Cache-Control`, so revisiting a
+  dataset does not download them again.
 
 ## The page
 
@@ -138,6 +140,19 @@ Everything is cached afterwards:
   Gaussian) powered by WebGL fragment shaders in `static/viewer.js` (with 2D
   Canvas fallback). Display-only: does not alter photometry or difference images.
 - A and B selectors, "A - B" and "(A + B) / 2".
+- Multi-frame **Stack** panel: choose one detector, type an exact wavelength
+  centre (or select a suggested value) and tolerance, optional dates, and use
+  the ticked frame rows to exclude images.
+  Wavelength is the calibrated effective wavelength at the target pixel.
+  The app reprocesses the selected cached FITS cutouts, target-centres the
+  images, and makes an inverse-variance weighted mean. Inspect the mean,
+  estimated per-pixel uncertainty, and contributor-count maps, or download
+  the float arrays as an NPZ file. If a selected FITS cutout is no longer in
+  the cache, the stack reports the missing cutout; rebuild the dataset to
+  fetch it again.
+  This averages observations over the selected dates, so use a narrow date
+  range for variable sources. The first stack for a selection takes time;
+  identical selections are cached.
 - Progressive preview: a 12-frame quick-look movie appears in seconds while
   the remaining detectors continue downloading and processing in the background.
 - Cancel button: stop an active build immediately and automatically cancel
@@ -234,8 +249,8 @@ in the same movie.  Two caches must be refreshed after changing the list:
 
 - No per-pixel spectrum.  The Measurements panel plots the target's aperture
   flux per frame, not a spectrum for every pixel.
-- No period search and no stacked image (the notebook's inverse-variance stack
-  needs float data the PNGs do not hold).
+- No period search. Stacks are static images; use the frame movie and date
+  limits to inspect temporal changes.
 - No pan/zoom beyond the browser's own image scaling.  The field is fixed by
   the FOV control.
 - No user accounts or server-side persistence.  The URL is the whole state.

@@ -198,13 +198,35 @@ PNGs and cached in the dataset directory. They are quick visual comparisons,
 not scientific flux subtraction. Comparisons are restricted to one detector
 because different detectors observe different wavelengths.
 
+The separate Stack panel reprocesses selected cached FITS cutouts to recover
+the floating-point images and variance maps. It restricts a stack to one
+detector, an effective-wavelength window at the target, optional dates, and
+the ticked frame rows. Each image is target-centred even if the movie is
+sky-locked. A local residual sky level is removed from each image; bad-flagged
+or uncovered pixels do not contribute. The weighted mean is
+`sum(image / variance) / sum(1 / variance)` at each pixel, and its estimated
+uncertainty is `sqrt(1 / sum(1 / variance))`. The coverage map counts valid
+contributions. The mean, uncertainty, total weight, and coverage arrays are
+saved as floating-point/integer data in a compressed NPZ; the PNG views are
+stretched for display. The wavelength stored in the manifest is the effective
+wavelength at the target pixel, retained to six decimal places for selection.
+If any selected FITS cutout is missing from cache, the stack stops with an
+error; rebuilding the dataset fetches required cutouts again. The first stack
+selection is computed once and cached at
+`data/<dataset-id>/stacks/<stack-id>/`.
+
+The uncertainty is an estimate rather than a full covariance calculation:
+the pipeline resamples each variance image onto the common grid with the same
+interpolation routine used for the image. This does not account for
+correlations between neighbouring output pixels introduced by resampling.
+
 ## What is cached
 
 | Location | Contents | Reused for |
 | --- | --- | --- |
 | `cutout_cache/exposures_*.ecsv` | IRSA exposure metadata table | Repeating an archive search for the same target coordinates |
 | `cutout_cache/*.fits` | Downloaded calibrated cutouts | Rebuilding dates, FOV, or detector selections that need the same cutouts |
-| `data/<dataset-id>/` | Manifest, rendered PNG frames, comparison PNGs | Returning the same completed request without rebuilding |
+| `data/<dataset-id>/` | Manifest, rendered PNG frames, comparison PNGs, and cached stack outputs under `stacks/` | Returning the same completed request or identical stack without recomputing |
 
 The cutout cache can become large. Removing it makes future requests download
 the FITS files again. Removing a dataset directory makes the app render that

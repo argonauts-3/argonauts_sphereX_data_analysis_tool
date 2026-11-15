@@ -1018,7 +1018,7 @@ def shifted_wcs(wcs, shift_ra_deg, shift_dec_deg):
 
 def align_frames(frames, ra, dec, fov_deg=None, track=True,
                  release_source=False, aux_planes=True,
-                 should_cancel=None):
+                 should_cancel=None, progress=None):
     """Resample every frame onto one common grid (stored in frame.*_aligned).
 
     `track=True` shifts each frame so the moving target stays at the centre.
@@ -1037,7 +1037,7 @@ def align_frames(frames, ra, dec, fov_deg=None, track=True,
     out_wcs, n = north_up_wcs(ra, dec, fov_deg)
     print(f"\noutput grid: {n}x{n} px, 6.1577\"/px, north up")
 
-    for frame in frames:
+    for index, frame in enumerate(frames):
         if should_cancel is not None and should_cancel():
             raise BuildCancelled("build cancelled")
         # Register on the moving target, not the background stars, so the
@@ -1062,6 +1062,9 @@ def align_frames(frames, ra, dec, fov_deg=None, track=True,
             frame.variance = None
             frame.flags = None
             frame.wcs = None
+
+        if progress is not None:
+            progress(index + 1, len(frames))
 
     fully_covered = [f for f in frames if f.footprint.mean() > 0.99]
     print(f"{len(fully_covered)}/{len(frames)} frames fully cover the output grid")

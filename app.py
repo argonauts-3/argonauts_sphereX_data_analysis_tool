@@ -21,11 +21,13 @@ Everything the page needs is also accepted as URL parameters, e.g.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import threading
 import traceback
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date
 from pathlib import Path
 
 import numpy as np
@@ -45,9 +47,11 @@ DATA_ROOT = dataset.DATA_ROOT
 # would only make both slower and hammer the archive.
 EXECUTOR = ThreadPoolExecutor(max_workers=1)
 JOBS = {}
+STACK_JOBS = {}
 JOBS_LOCK = threading.Lock()
 
 ID_RE = re.compile(r"^[0-9a-f]{12}$")
+STACK_ID_RE = re.compile(r"^[0-9a-f]{16}$")
 
 # Small curated list for the drop-down.  Proper motions are included only
 # where they are well known; the rest are slow enough to be irrelevant over
@@ -276,6 +280,31 @@ def _run_build(key, params):
         dataset.remove_dataset(key)
 
 
+def _set_stack_job(dataset_key, stack_key, **fields):
+    with JOBS_LOCK:
+        job = STACK_JOBS.setdefault((dataset_key, stack_key), {})
+        job.update(fields)
+
+
+def _run_stack(dataset_key, stack_key, manifest, entries, params):
+    def progress(phase, done, total):
+        _set_stack_job(dataset_key, stack_key, phase=phase,
+                       done=int(done), total=int(total))
+
+    _set_stack_job(dataset_key, stack_key, state="running", phase="starting",
+                   done=0, total=len(entries), error=None)
+    try:
+        result = dataset.build_stack_from_cutouts(
+            dataset_key, stack_key, manifest, entries, params, progress=progress)
+        _set_stack_job(dataset_key, stack_key, state="ready", phase="ready",
+                       done=len(entries), total=len(entries), result=result,
+                       error=None)
+    except Exception as exc:                    # noqa: BLE001 - report to the UI
+        traceback.print_exc()
+        _set_stack_job(dataset_key, stack_key, state="error", phase="error",
+                       error=str(exc))
+
+
 # ==========================================================================
 # Routes
 # ==========================================================================
@@ -401,6 +430,141 @@ def api_job(key):
                     }
                     break
     return jsonify(id=key, **job)
+
+
+def _iso_date(value, label):
+    if value in (None, ""):
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be an ISO date")
+    try:
+        return date.fromisoformat(value).isoformat()
+    except ValueError as exc:
+        raise ValueError(f"{label} must be an ISO date such as 2026-01-31") from exc
+
+
+@app.post("/api/stack/<key>")
+def api_stack(key):
+    """Queue a same-detector inverse-variance stack from cached FITS cutouts."""
+    if not ID_RE.match(key):
+        return jsonify(error="bad dataset id"), 400
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return jsonify(error="expected a JSON object"), 400
+
+    manifest_path = DATA_ROOT / key / "manifest.json"
+    if not manifest_path.exists():
+        return jsonify(error="dataset not built"), 404
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return jsonify(error="dataset manifest could not be read"), 500
+    if manifest.get("complete") is False:
+        return jsonify(error="wait for the full dataset before stacking"), 409
+
+    band = body.get("band")
+    if band not in pipeline.BANDS:
+        return jsonify(error="choose one valid detector"), 400
+    try:
+        wavelength_center = float(body.get("wavelength_center_um"))
+        wavelength_tolerance = float(body.get("wavelength_tolerance_um"))
+    except (TypeError, ValueError):
+        return jsonify(error="wavelength centre and tolerance must be numbers"), 400
+    if (not np.isfinite(wavelength_center) or not 0.0 < wavelength_center < 20.0
+            or not np.isfinite(wavelength_tolerance)
+            or not 0.0 <= wavelength_tolerance <= 1.0):
+        return jsonify(error="invalid wavelength centre or tolerance"), 400
+    try:
+        date_start = _iso_date(body.get("date_start"), "start date")
+        date_end = _iso_date(body.get("date_end"), "end date")
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    if date_start and date_end and date_start > date_end:
+        return jsonify(error="start date is after end date"), 400
+
+    raw_indices = body.get("indices")
+    if not isinstance(raw_indices, list):
+        return jsonify(error="frame indices must be a list"), 400
+    valid_indices = set()
+    for value in raw_indices:
+        if isinstance(value, bool) or not isinstance(value, int):
+            return jsonify(error="frame indices must be integers"), 400
+        valid_indices.add(value)
+
+    all_frames = manifest.get("frames", [])
+    if len(valid_indices) > len(all_frames):
+        return jsonify(error="too many frame indices"), 400
+    selected = []
+    for entry in all_frames:
+        index = entry.get("index")
+        if index not in valid_indices or entry.get("band") != band:
+            continue
+        wavelength = entry.get("wavelength_um")
+        if wavelength is None or not np.isfinite(float(wavelength)):
+            continue
+        if abs(float(wavelength) - wavelength_center) > wavelength_tolerance + 1e-12:
+            continue
+        frame_date = entry.get("date")
+        if date_start and frame_date < date_start:
+            continue
+        if date_end and frame_date > date_end:
+            continue
+        selected.append(entry)
+
+    if len(selected) < 2:
+        return jsonify(error=f"only {len(selected)} checked frame(s) match; "
+                              "at least two are needed"), 400
+
+    params = {
+        "band": band,
+        "wavelength_center_um": round(wavelength_center, 8),
+        "wavelength_tolerance_um": round(wavelength_tolerance, 8),
+        "date_start": date_start,
+        "date_end": date_end,
+        "indices": [int(entry["index"]) for entry in selected],
+        "version": dataset.VERSION,
+    }
+    signature = json.dumps({"dataset": key, **params}, sort_keys=True,
+                           separators=(",", ":")).encode()
+    stack_key = hashlib.sha256(signature).hexdigest()[:16]
+    stack_dir = DATA_ROOT / key / "stacks" / stack_key
+    metadata_path = stack_dir / "metadata.json"
+    if metadata_path.exists():
+        try:
+            result = json.loads(metadata_path.read_text())
+            return jsonify(id=stack_key, state="ready", result=result)
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    job_key = (key, stack_key)
+    with JOBS_LOCK:
+        existing = STACK_JOBS.get(job_key)
+        if existing and existing.get("state") in ("queued", "running"):
+            return jsonify(id=stack_key, state=existing["state"]), 202
+        STACK_JOBS[job_key] = {
+            "state": "queued", "phase": "queued", "done": 0,
+            "total": len(selected), "error": None,
+        }
+        EXECUTOR.submit(_run_stack, key, stack_key, manifest, selected, params)
+    return jsonify(id=stack_key, state="queued", total=len(selected)), 202
+
+
+@app.get("/api/stack/<key>/<stack_key>")
+def api_stack_status(key, stack_key):
+    if not ID_RE.match(key) or not STACK_ID_RE.match(stack_key):
+        return jsonify(error="bad stack id"), 400
+    metadata_path = DATA_ROOT / key / "stacks" / stack_key / "metadata.json"
+    if metadata_path.exists():
+        try:
+            result = json.loads(metadata_path.read_text())
+            return jsonify(id=stack_key, state="ready", result=result)
+        except (OSError, json.JSONDecodeError):
+            pass
+    with JOBS_LOCK:
+        job = STACK_JOBS.get((key, stack_key))
+        if not job:
+            return jsonify(error="unknown stack job"), 404
+        return jsonify(id=stack_key, **job)
 
 
 @app.get("/api/dataset/<key>")

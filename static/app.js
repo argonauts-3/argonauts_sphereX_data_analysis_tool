@@ -72,6 +72,10 @@ const state = {
   compareRefresh: 0,
   urlTimer: null,
   colorbarKey: "",
+  stackResult: null,
+  stackLayer: "mean",
+  stackRequestToken: 0,
+  stackBusy: false,
 };
 
 // --------------------------------------------------------------------------
@@ -278,6 +282,17 @@ function wireControls() {
   $("backBtn").addEventListener("click", () => backToMovie());
   $("subBtn").addEventListener("click", () => showDiff("sub"));
   $("addBtn").addEventListener("click", () => showDiff("add"));
+  $("stackBandSelect").addEventListener("change", () => {
+    updateStackWavelengthOptions($("stackBandSelect").value);
+  });
+  $("stackWavelengthSelect").addEventListener("input", updateStackSelectionNote);
+  $("stackToleranceInput").addEventListener("input", updateStackSelectionNote);
+  $("stackDateStart").addEventListener("change", updateStackSelectionNote);
+  $("stackDateEnd").addEventListener("change", updateStackSelectionNote);
+  $("stackBtn").addEventListener("click", startStack);
+  $("stackLayerSelect").addEventListener("change", () => {
+    if (state.stackResult) showStack(state.stackResult, $("stackLayerSelect").value);
+  });
 
   document.querySelectorAll("[data-preset]").forEach(button => {
     button.addEventListener("click", () => {
@@ -526,6 +541,9 @@ async function startBuild(request) {
   }
 
   const token = ++state.buildToken;
+  state.stackRequestToken += 1;
+  state.stackResult = null;
+  resetStackUI();
   pause();
   backToMovie(true);
   clearDirty();
@@ -712,11 +730,14 @@ function applyManifest(manifest, options = {}) {
   state.manifest = manifest;
   state.frames = manifest.frames || [];
   state.mode = "movie";
+  state.stackResult = null;
+  resetStackUI();
 
   adoptPendingSkip(manifest);
   renderSummary(manifest);
   renderTable(state.frames);
   setupWavelengthSliders(state.frames);
+  setupStackControls(state.frames);
   recomputeVisible({ resetCompare: true });
   updatePreviewBanner(manifest);
 
@@ -826,7 +847,7 @@ function changePlaybackRate(value) {
 }
 
 function play() {
-  if (state.playing || state.mode === "diff" || !state.order.length) return;
+  if (state.playing || state.mode !== "movie" || !state.order.length) return;
   state.playing = true;
   $("playBtn").textContent = "Pause";
   const interval = Math.max(80, 1000 / state.fps);
@@ -853,6 +874,9 @@ function setIndex(index) {
   $("backBtn").hidden = true;
   $("legend").hidden = true;
   $("playBtn").disabled = false;
+  $("prevBtn").disabled = false;
+  $("nextBtn").disabled = false;
+  SliderControls.get("frame")?.setDisabled(state.order.length === 0);
 
   pushLevels();
 
@@ -971,6 +995,7 @@ function recomputeVisible({ resetCompare = false } = {}) {
 
   paintTableVisibility();
   updateFilterCount();
+  updateStackSelectionNote();
   if (resetCompare) fillCompare({ reset: true });
   else scheduleCompareRefresh();
   state.plots?.update(frames, state.visible);
@@ -1392,10 +1417,213 @@ function backToMovie(silent = false) {
     $("backBtn").hidden = true;
     $("legend").hidden = true;
     $("playBtn").disabled = false;
+    $("prevBtn").disabled = false;
+    $("nextBtn").disabled = false;
+    SliderControls.get("frame")?.setDisabled(state.order.length === 0);
     applyLevelsToView();
     return;
   }
   setIndex(state.index);
+}
+
+// --------------------------------------------------------------------------
+// Multi-frame inverse-variance stack
+// --------------------------------------------------------------------------
+
+function resetStackUI() {
+  state.stackBusy = false;
+  $("stackBtn").disabled = !state.manifest?.complete;
+  $("stackLayerField").hidden = true;
+  $("stackDownload").hidden = true;
+  $("stackDownload").removeAttribute("href");
+  $("stackStatus").classList.remove("error");
+  $("stackStatus").textContent = "Choose one detector and wavelength range. " +
+    "Only ticked frames are considered. Stacking reprocesses cached FITS cutouts.";
+}
+
+function setupStackControls(frames) {
+  const bandSelect = $("stackBandSelect");
+  const available = BANDS.filter(band => frames.some(frame => frame.band === band));
+  const previous = bandSelect.value;
+  bandSelect.innerHTML = available.map(band =>
+    `<option value="${band}">${BAND_SHORT[band]}</option>`).join("");
+  if (!available.length) {
+    $("stackWavelengthOptions").replaceChildren();
+    $("stackBtn").disabled = true;
+    return;
+  }
+  const currentBand = frames[state.index]?.band;
+  const band = available.includes(previous) ? previous
+    : (available.includes(currentBand) ? currentBand : available[0]);
+  bandSelect.value = band;
+  const currentWavelength = frames[state.index]?.wavelength_um;
+  updateStackWavelengthOptions(band, Number.isFinite(currentWavelength)
+    ? Number(currentWavelength.toFixed(5)) : null);
+  $("stackBtn").disabled = !state.manifest?.complete;
+  updateStackSelectionNote();
+}
+
+function updateStackWavelengthOptions(band, preferred = null) {
+  const groups = new Map();
+  for (const frame of state.frames) {
+    if (frame.band !== band || !Number.isFinite(frame.wavelength_um)) continue;
+    const wavelength = Number(frame.wavelength_um.toFixed(5));
+    groups.set(wavelength, (groups.get(wavelength) || 0) + 1);
+  }
+  const values = [...groups.keys()].sort((a, b) =>
+    groups.get(b) - groups.get(a) || a - b);
+  $("stackWavelengthOptions").innerHTML = values.map(wavelength =>
+    `<option value="${wavelength}" label="${groups.get(wavelength)} matching frame` +
+    `${groups.get(wavelength) === 1 ? "" : "s"}"></option>`
+  ).join("");
+  if (!values.length) {
+    updateStackSelectionNote();
+    return;
+  }
+  const selected = values.includes(preferred) ? preferred : values[0];
+  $("stackWavelengthSelect").value = String(selected);
+  updateStackSelectionNote();
+}
+
+function stackCandidateIndices() {
+  const band = $("stackBandSelect").value;
+  const center = Number($("stackWavelengthSelect").value);
+  const tolerance = Number($("stackToleranceInput").value);
+  const start = $("stackDateStart").value;
+  const end = $("stackDateEnd").value;
+  if (!Number.isFinite(center) || center <= 0 || center >= 20
+      || !Number.isFinite(tolerance) || tolerance < 0) return [];
+  return state.frames.flatMap((frame, index) => {
+    if (frame.band !== band || state.excluded.has(frameKey(frame))) return [];
+    if (!Number.isFinite(frame.wavelength_um)
+        || Math.abs(frame.wavelength_um - center) > tolerance + 1e-12) return [];
+    if (start && frame.date < start) return [];
+    if (end && frame.date > end) return [];
+    return [index];
+  });
+}
+
+function updateStackSelectionNote() {
+  if (state.stackBusy) return;
+  const count = stackCandidateIndices().length;
+  const complete = Boolean(state.manifest?.complete);
+  $("stackBtn").disabled = !complete || count < 2;
+  $("stackStatus").classList.remove("error");
+  $("stackStatus").textContent = complete
+    ? `${count} checked frame${count === 1 ? "" : "s"} match this detector, wavelength window, and dates. ` +
+      (state.stackResult ? "Build again to update the displayed stack." : "At least two are needed.")
+    : "Wait for the full dataset before stacking.";
+}
+
+async function startStack() {
+  if (!state.datasetId || !state.manifest?.complete || state.stackBusy) return;
+  const indices = stackCandidateIndices();
+  if (indices.length < 2) {
+    $("stackStatus").classList.add("error");
+    $("stackStatus").textContent = "At least two checked frames must match the selection.";
+    return;
+  }
+
+  const token = ++state.stackRequestToken;
+  state.stackBusy = true;
+  pause();
+  $("stackBtn").disabled = true;
+  $("stackStatus").classList.remove("error");
+  $("stackStatus").textContent = `Starting a stack from ${indices.length} cached FITS cutouts…`;
+  try {
+    const response = await postJSON(`/api/stack/${state.datasetId}`, {
+      band: $("stackBandSelect").value,
+      wavelength_center_um: Number($("stackWavelengthSelect").value),
+      wavelength_tolerance_um: Number($("stackToleranceInput").value),
+      date_start: $("stackDateStart").value || null,
+      date_end: $("stackDateEnd").value || null,
+      indices,
+    });
+    if (token !== state.stackRequestToken) return;
+    if (response.state === "ready") {
+      finishStack(response.result);
+      return;
+    }
+    await pollStack(response.id, token);
+  } catch (err) {
+    if (token !== state.stackRequestToken) return;
+    state.stackBusy = false;
+    $("stackBtn").disabled = false;
+    $("stackStatus").classList.add("error");
+    $("stackStatus").textContent = `Stack failed: ${err.message}`;
+  }
+}
+
+async function pollStack(stackId, token) {
+  while (token === state.stackRequestToken) {
+    await sleep(650);
+    const status = await getJSON(`/api/stack/${state.datasetId}/${stackId}`);
+    if (token !== state.stackRequestToken) return;
+    if (status.state === "ready") {
+      finishStack(status.result);
+      return;
+    }
+    if (status.state === "error") {
+      state.stackBusy = false;
+      $("stackBtn").disabled = false;
+      $("stackStatus").classList.add("error");
+      $("stackStatus").textContent = `Stack failed: ${status.error}`;
+      return;
+    }
+    const phase = status.phase === "queued" ? "queued behind another build"
+      : status.phase === "reading" ? `reprocessing cutouts ${status.done}/${status.total}`
+      : status.phase === "aligning" ? `aligning images ${status.done}/${status.total}`
+      : status.phase === "stacking" ? `combining images ${status.done}/${status.total}`
+      : "working";
+    $("stackStatus").textContent = `Stack: ${phase}…`;
+  }
+}
+
+function finishStack(result) {
+  state.stackBusy = false;
+  state.stackResult = result;
+  $("stackBtn").disabled = false;
+  $("stackLayerField").hidden = false;
+  $("stackDownload").href = result.data_url;
+  $("stackDownload").download = `spherex-${result.dataset_id}-stack.npz`;
+  $("stackDownload").hidden = false;
+  $("stackStatus").classList.remove("error");
+  $("stackStatus").textContent =
+    `Stacked ${result.n_used} of ${result.n_selected} selected frames. ` +
+    `${result.band.slice(-2)}, ${fmt(result.wavelength_min_um, 5)}–` +
+    `${fmt(result.wavelength_max_um, 5)} µm; ${result.date_min} to ${result.date_max}. ` +
+    `At the target: ${result.target_contributors} contributors, ` +
+    `uncertainty ${fmt(result.target_uncertainty_mjy_sr, 5)} MJy/sr.`;
+  $("stackLayerSelect").value = "mean";
+  showStack(result, "mean");
+}
+
+function showStack(result, layer) {
+  if (!result) return;
+  state.stackResult = result;
+  state.stackLayer = layer;
+  state.mode = "stack";
+  pause();
+  state.viewer.setLevels(0, 1);
+  const url = layer === "uncertainty" ? result.uncertainty_url
+    : layer === "coverage" ? result.coverage_url : result.mean_url;
+  state.viewer.showURL(url);
+  updateColorbar();
+  $("legend").hidden = false;
+  $("legend").textContent = layer === "uncertainty"
+    ? `Estimated per-pixel standard error (MJy/sr); target ${fmt(result.target_uncertainty_mjy_sr, 5)} MJy/sr.`
+    : layer === "coverage"
+      ? `Number of accepted frames per pixel; up to ${result.max_contributors} contributors.`
+      : `Inverse-variance weighted mean in MJy/sr from ${result.n_used} ${result.band.slice(-2)} frames.`;
+  $("targetMarker").hidden = true;
+  $("backBtn").hidden = false;
+  $("playBtn").disabled = true;
+  $("prevBtn").disabled = true;
+  $("nextBtn").disabled = true;
+  SliderControls.get("frame")?.setDisabled(true);
+  $("caption").textContent =
+    `Stack   ${result.band.slice(-2)}   ${fmt(result.wavelength_center_um, 5)} ± ` +
+    `${fmt(result.wavelength_tolerance_um, 5)} µm   ${result.date_min} to ${result.date_max}`;
 }
 
 // --------------------------------------------------------------------------

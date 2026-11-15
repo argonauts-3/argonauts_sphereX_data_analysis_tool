@@ -231,6 +231,15 @@ main {
 #compareBox .field { margin-bottom: 6px; }
 #compareBox select { width: 100%; }
 
+#stackBox .field { margin-bottom: 6px; }
+#stackBox select,
+#stackBox input[type="number"] { width: 100%; }
+#stackBox .stack-dates { justify-content: space-between; gap: 8px; }
+#stackBox .stack-dates .field { flex: 1; }
+#stackBox .stack-dates input { width: 100%; }
+#stackLayerField { margin-top: 8px; }
+#stackDownload { display: inline-block; margin-top: 8px; color: var(--accent); }
+
 #tableWrap { max-height: 280px; overflow: auto; }
 table { border-collapse: collapse; width: 100%; font-size: 11.5px; }
 th, td { text-align: right; padding: 3px 5px; white-space: nowrap; }

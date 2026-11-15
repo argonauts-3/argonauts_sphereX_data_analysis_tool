@@ -180,6 +180,48 @@
         bands is not a difference image.</p>
     </section>
 
+    <section id="stackBox">
+      <h2>Stack similar wavelengths</h2>
+      <div class="field">
+        <label for="stackBandSelect">Detector</label>
+        <select id="stackBandSelect"></select>
+      </div>
+      <div class="field">
+        <label for="stackWavelengthSelect">Wavelength centre (µm)</label>
+        <input id="stackWavelengthSelect" type="number" min="0.000001"
+               max="19.999999" step="any" list="stackWavelengthOptions"
+               inputmode="decimal" required>
+        <datalist id="stackWavelengthOptions"></datalist>
+      </div>
+      <div class="field">
+        <label for="stackToleranceInput">Tolerance (± µm)</label>
+        <input id="stackToleranceInput" type="number" min="0" max="1"
+               step="0.00001" value="0.00005">
+      </div>
+      <div class="pair stack-dates">
+        <div class="field">
+          <label for="stackDateStart">From</label>
+          <input id="stackDateStart" type="date">
+        </div>
+        <div class="field">
+          <label for="stackDateEnd">To</label>
+          <input id="stackDateEnd" type="date">
+        </div>
+      </div>
+      <button id="stackBtn" type="button" disabled>Build stack</button>
+      <div class="field" id="stackLayerField" hidden>
+        <label for="stackLayerSelect">Show</label>
+        <select id="stackLayerSelect">
+          <option value="mean">Weighted mean</option>
+          <option value="uncertainty">Uncertainty map</option>
+          <option value="coverage">Contributing frames</option>
+        </select>
+      </div>
+      <a id="stackDownload" hidden download>Download float stack data (.npz)</a>
+      <p class="note" id="stackStatus">Choose one detector and wavelength range.
+        Only ticked frames are considered. Stacking reprocesses cached FITS cutouts.</p>
+    </section>
+
     <section id="framesBox">
       <h2>Frames</h2>
       <div id="wlFilter">
@@ -264,6 +306,17 @@
       frame still shows it. These choices are saved in the URL
       (<code>wl0</code>, <code>wl1</code>, <code>skip</code>,
       <code>lo</code>, <code>hi</code>).</p>
+
+    <h3>Stack more than two frames</h3>
+    <p>In <strong>Stack similar wavelengths</strong>, choose one detector and
+      type the exact wavelength centre in microns, or pick a suggested value
+      from the frames. Set the ± tolerance; only checked frames from that
+      detector within the wavelength window and optional date limits are used.
+      At least two frames must match. The stack reprocesses cached FITS cutouts
+      and aligns the target before combining images. Choose the weighted mean,
+      estimated uncertainty, or contributing-frame map. Download the NPZ for
+      floating-point arrays. Narrow the dates when studying a variable source,
+      since stacking combines the selected epochs.</p>
 
     <h3>Measurements</h3>
     <p>The spectrum plots aperture flux against wavelength; the light curve

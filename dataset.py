@@ -32,7 +32,7 @@ import test as pipeline
 
 # Bump this when the pipeline, manifest schema or rendering changes.  It is
 # part of the dataset id, so results made with old pipeline logic are ignored.
-VERSION = 3
+VERSION = 4
 
 REPO = Path(__file__).resolve().parent
 DATA_ROOT = REPO / "data"
@@ -167,7 +167,9 @@ def render_frames(frames, out_dir: Path, progress=None, subdir="frames",
             "mjd": round(float(frame.mjd), 6),
             "iso": frame.obs_time.iso,
             "date": frame.obs_time.iso[:10],
-            "wavelength_um": _num(frame.wavelength_um, 4),
+            # Preserve enough precision for the stack selector's wavelength
+            # tolerance; four decimals could merge distinct response values.
+            "wavelength_um": _num(frame.wavelength_um, 6),
             "bandwidth_um": _num(frame.bandwidth_um, 4),
             "flux_ujy": _num(frame.flux_ujy, 2),
             "err_ujy": _num(frame.err_ujy, 2),
@@ -490,6 +492,236 @@ def build_dataset(ra_deg, dec_deg, dataset_key, fov_deg, t0, t1, bands,
         if not manifest_file.exists():
             remove_dataset(dataset_key)
         raise
+
+
+def _stack_display_png(array, valid, path, percentiles=(1.0, 99.5)):
+    """Save a percentile-stretched 8-bit view; zero remains no coverage."""
+    values = np.asarray(array)[valid & np.isfinite(array)]
+    output = np.zeros(array.shape, dtype=np.uint8)
+    if values.size:
+        lo, hi = np.nanpercentile(values, percentiles)
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            lo = float(np.nanmin(values))
+            hi = float(np.nanmax(values))
+            if hi <= lo:
+                lo -= 0.5
+                hi += 0.5
+        scaled = np.clip((array - lo) / (hi - lo), 0.0, 1.0)
+        output[valid & np.isfinite(array)] = (
+            1 + scaled[valid & np.isfinite(array)] * 254.0
+        ).astype(np.uint8)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(np.flipud(output)).save(path, optimize=True)
+    return [float(lo), float(hi)] if values.size else [None, None]
+
+
+def build_stack_from_cutouts(dataset_key, stack_key, manifest, entries,
+                             params, progress=None):
+    """Reprocess cached FITS cutouts into an inverse-variance weighted stack.
+
+    The stack always recentres the target before combining, independent of the
+    movie's sky-fixed/tracking display choice. No aligned float images are
+    retained by the dataset build, so this recomputes the selected frames from
+    their cached cutouts on demand.
+    """
+    out_dir = DATA_ROOT / dataset_key / "stacks" / stack_key
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    target_info = manifest["target"]
+    target = SkyCoord(ra=float(target_info["ra_deg"]) * u.deg,
+                      dec=float(target_info["dec_deg"]) * u.deg,
+                      frame="icrs")
+    proper_motion = (
+        float(target_info.get("pm_ra_mas_yr", 0.0)) * u.mas / u.yr,
+        float(target_info.get("pm_dec_mas_yr", 0.0)) * u.mas / u.yr,
+    )
+    exposure_cache = CUTOUT_ROOT / (
+        f"exposures_{target.ra.deg:.3f}_{target.dec.deg:.3f}".replace("-", "m")
+        + ".ecsv"
+    )
+    if not exposure_cache.exists():
+        raise RuntimeError("the cached IRSA exposure table is missing; rebuild the dataset first")
+
+    exposures = pipeline.Table.read(exposure_cache)
+    if len(exposures) == 0:
+        raise RuntimeError("the cached IRSA exposure table is empty")
+    # The manifest grid centre is the exact 7-decimal coordinate used in the
+    # cutout URLs. Reuse it verbatim so URL hashing finds the cached FITS files.
+    reference_ra, reference_dec = manifest["grid"]["crval"]
+    reference = SkyCoord(ra=float(reference_ra) * u.deg,
+                         dec=float(reference_dec) * u.deg, frame="icrs")
+    cutout_size = float(manifest["request"]["cutout_size_deg"])
+
+    rows_by_key = {}
+    for row in exposures:
+        key = (str(row["energy_bandpassname"]), str(row["obs_id"]))
+        rows_by_key.setdefault(key, row)
+
+    sizes = (cutout_size,) + tuple(
+        size for size in FETCH_TIERS_DEG if size > cutout_size
+    )
+    selected_rows = []
+    missing = []
+    for entry in entries:
+        key = (str(entry["band"]), str(entry["obs_id"]))
+        row = rows_by_key.get(key)
+        if row is None:
+            missing.append(f"{entry['band_label']} {entry['obs_id']} (archive row)")
+            continue
+        cached = any(
+            pipeline.cutout_cache_path(
+                pipeline.cutout_url(row["access_url"], reference.ra.deg,
+                                    reference.dec.deg, size), CUTOUT_ROOT
+            ).exists()
+            for size in sizes
+        )
+        if not cached:
+            missing.append(f"{entry['band_label']} {entry['obs_id']} (FITS cutout)")
+        else:
+            selected_rows.append((entry, row))
+
+    if missing:
+        preview = ", ".join(missing[:3])
+        suffix = "..." if len(missing) > 3 else ""
+        raise RuntimeError(
+            f"{len(missing)} selected cached cutout(s) are unavailable: {preview}{suffix}"
+        )
+
+    frames = []
+    total = len(selected_rows)
+    for done, (entry, row) in enumerate(selected_rows, 1):
+        frame = pipeline.load_frame(
+            row, entry["band"], target, reference, cutout_size,
+            proper_motion=proper_motion, cutout_dir=CUTOUT_ROOT,
+            reuse_sizes=FETCH_TIERS_DEG,
+        )
+        if frame is not None:
+            frames.append(frame)
+        if progress is not None:
+            progress("reading", done, total)
+
+    if len(frames) < 2:
+        raise RuntimeError(
+            f"only {len(frames)} of {total} selected cutouts could be reprocessed; "
+            "at least two are needed to stack"
+        )
+
+    # For a useful stack, always register on the target even when the movie is
+    # sky-locked. Keep variance and flags so they can control pixel weights.
+    pipeline.align_frames(
+        frames, reference.ra.deg, reference.dec.deg,
+        fov_deg=float(manifest["request"]["fov_deg"]), track=True,
+        release_source=True, aux_planes=True,
+        progress=(lambda done, count: progress("aligning", done, count))
+        if progress is not None else None,
+    )
+    frames = [frame for frame in frames if frame.image_aligned is not None]
+    if len(frames) < 2:
+        raise RuntimeError(
+            f"only {len(frames)} selected cutouts aligned; at least two are needed"
+        )
+
+    shape = frames[0].image_aligned.shape
+    height, width = shape
+    yy, xx = np.mgrid[0:height, 0:width]
+    cx = (width - 1) / 2.0
+    cy = (height - 1) / 2.0
+    distance = np.hypot(xx - cx, yy - cy)
+    background_annulus = (distance >= 6.0) & (distance <= 12.0)
+
+    weighted_sum = np.zeros(shape, dtype=np.float64)
+    weight_sum = np.zeros(shape, dtype=np.float64)
+    count = np.zeros(shape, dtype=np.uint16)
+    for index, frame in enumerate(frames, 1):
+        image = np.asarray(frame.image_aligned, dtype=np.float64)
+        variance = np.asarray(frame.variance_aligned, dtype=np.float64)
+        flags = np.asarray(frame.flags_aligned, dtype=np.int32)
+        footprint = np.asarray(frame.footprint, dtype=np.float64)
+        valid = (np.isfinite(image) & np.isfinite(variance) & (variance > 0)
+                 & np.isfinite(footprint) & (footprint > 0)
+                 & ((flags & frame.bad_bits) == 0))
+
+        # Remove each frame's residual local sky level before combining. Add
+        # its robust scatter to the variance so noisy backgrounds get less
+        # weight as well as being centred consistently.
+        ring = background_annulus & valid
+        if ring.sum() < 20:
+            ring = (distance >= 4.0) & (distance <= 15.0) & valid
+        if ring.sum() >= 20:
+            sky = float(np.median(image[ring]))
+            sky_noise = 1.4826 * float(np.median(np.abs(image[ring] - sky)))
+        else:
+            sky = 0.0
+            sky_noise = 0.0
+        image = image - sky
+        variance = variance + sky_noise ** 2
+        valid &= np.isfinite(variance) & (variance > 0)
+        weight = np.zeros(shape, dtype=np.float64)
+        weight[valid] = 1.0 / variance[valid]
+        weighted_sum[valid] += image[valid] * weight[valid]
+        weight_sum[valid] += weight[valid]
+        count[valid] += 1
+        if progress is not None:
+            progress("stacking", index, len(frames))
+
+    covered = weight_sum > 0
+    stack = np.full(shape, np.nan, dtype=np.float32)
+    uncertainty = np.full(shape, np.nan, dtype=np.float32)
+    stack[covered] = (weighted_sum[covered] / weight_sum[covered]).astype(np.float32)
+    uncertainty[covered] = np.sqrt(1.0 / weight_sum[covered]).astype(np.float32)
+    weight_map = weight_sum.astype(np.float32)
+
+    npz_path = out_dir / "stack.npz"
+    tmp_path = out_dir / "stack.npz.part"
+    with tmp_path.open("wb") as handle:
+        np.savez_compressed(handle, stack_mjy_sr=stack,
+                            uncertainty_mjy_sr=uncertainty,
+                            weight_sum_sr2_per_mjy2=weight_map,
+                            contributing_frames=count)
+    tmp_path.replace(npz_path)
+
+    _stack_display_png(stack, covered, out_dir / "mean.png")
+    _stack_display_png(uncertainty, covered, out_dir / "uncertainty.png")
+    _stack_display_png(count.astype(np.float32), covered,
+                       out_dir / "coverage.png", percentiles=(0.0, 100.0))
+
+    ix = int(round(cx))
+    iy = int(round(cy))
+    frame_wavelengths = [float(frame.wavelength_um) for frame in frames
+                         if np.isfinite(frame.wavelength_um)]
+    frame_dates = [frame.obs_time.iso[:10] for frame in frames]
+    covered_uncertainty = uncertainty[covered]
+    metadata = {
+        "id": stack_key,
+        "dataset_id": dataset_key,
+        "band": frames[0].band,
+        "n_selected": len(entries),
+        "n_used": len(frames),
+        "wavelength_center_um": float(params["wavelength_center_um"]),
+        "wavelength_tolerance_um": float(params["wavelength_tolerance_um"]),
+        "wavelength_min_um": min(frame_wavelengths) if frame_wavelengths else None,
+        "wavelength_max_um": max(frame_wavelengths) if frame_wavelengths else None,
+        "date_min": min(frame_dates) if frame_dates else None,
+        "date_max": max(frame_dates) if frame_dates else None,
+        "width": width,
+        "height": height,
+        "units": "MJy/sr",
+        "target_contributors": int(count[iy, ix]),
+        "target_uncertainty_mjy_sr": _num(uncertainty[iy, ix], 8),
+        "median_uncertainty_mjy_sr": _num(np.nanmedian(covered_uncertainty), 8),
+        "max_contributors": int(count.max()),
+        "mean_url": f"/data/{dataset_key}/stacks/{stack_key}/mean.png",
+        "uncertainty_url": f"/data/{dataset_key}/stacks/{stack_key}/uncertainty.png",
+        "coverage_url": f"/data/{dataset_key}/stacks/{stack_key}/coverage.png",
+        "data_url": f"/data/{dataset_key}/stacks/{stack_key}/stack.npz",
+        "npz_contents": ["stack_mjy_sr", "uncertainty_mjy_sr",
+                         "weight_sum_sr2_per_mjy2", "contributing_frames"],
+    }
+    meta_path = out_dir / "metadata.json"
+    meta_tmp = out_dir / "metadata.json.part"
+    meta_tmp.write_text(json.dumps(metadata, indent=1))
+    meta_tmp.replace(meta_path)
+    return metadata
 
 
 def remove_dataset(dataset: str):

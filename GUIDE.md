@@ -101,6 +101,25 @@ The A/B Comparison tool enables visual differencing between two epochs:
   - **(A + B) / 2:** Displays the mean co-addition of both epochs, reducing visual noise.
 - **Same-Detector Rule:** Differencing between two different detectors (e.g. D1 vs D5) is prohibited and flagged with an explanation. Detectors observe completely different wavelengths and PSFs, meaning cross-band subtraction represents chromatic color differences rather than physical variability.
 
+### Multi-frame S/N stack
+
+Use the **Stack similar wavelengths** panel to combine more than two images.
+Choose one detector, type an exact wavelength centre (or choose a suggested
+centre from wavelengths present in the frames), set the ± tolerance in microns,
+and optionally set start/end dates. Only rows still ticked in the Frames table
+are candidates; the stack then applies the detector, wavelength, and date
+limits. At least two images must match. Stacks never mix detectors by default.
+
+The app reprocesses the selected cached FITS cutouts, aligns each image on the
+target, subtracts a local residual sky level, and calculates a per-pixel
+inverse-variance weighted mean. The layer menu displays that mean, its
+estimated per-pixel uncertainty, or the number of frames contributing to each
+pixel. The downloadable NPZ contains the floating-point mean, uncertainty,
+weight sum, and contributor count; the PNG shown on screen is stretched for
+viewing. The first stack for a selection can take time, but identical stacks
+are cached. Since stacking averages the selected dates, narrow the date range
+when studying a variable source.
+
 ---
 
 ## 8. Reading Flux, S/N, Flags, and Offsets
