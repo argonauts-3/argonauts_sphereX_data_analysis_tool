@@ -490,6 +490,13 @@ function updateMarker(frame) {
     marker.hidden = true;
     return;
   }
+  // With tracking on, the reprojection has already put the target at the
+  // centre, so the sky-motion offset in the manifest is not where the target
+  // is in this image.
+  if (state.manifest.request.track) {
+    marker.hidden = true;
+    return;
+  }
   const offset = frame.target_offset_px;
   if (!offset) {
     marker.hidden = true;
@@ -607,6 +614,7 @@ function renderFrameInfo(frame) {
     ? `${frame.target_flag_names} (bad bit set)`
     : frame.target_flag_names;
   const offset = frame.target_offset_px;
+  const tracked = Boolean(state.manifest?.request.track);
   setKV($("frameInfo"), [
     ["Date", frame.iso.replace("T", " ").slice(0, 19)],
     ["Detector", `${frame.band_label} (${frame.band})`],
@@ -616,7 +624,9 @@ function renderFrameInfo(frame) {
       ? "-" : `${fmt(frame.flux_ujy, 1)} +/- ${fmt(frame.err_ujy, 1)} uJy`],
     ["Peak S/N", fmt(frame.peak_snr, 1)],
     ["Target flag", flagText],
-    ["Offset", offset ? `${fmt(offset[0], 1)}, ${fmt(offset[1], 1)} px` : "-"],
+    ["Offset", tracked
+      ? "centred (tracking)"
+      : (offset ? `${fmt(offset[0], 1)}, ${fmt(offset[1], 1)} px` : "-")],
     ["Sky level", `${fmt(frame.background_mjy_sr, 4)} MJy/sr removed`],
     ["Obs id", frame.obs_id],
   ]);
