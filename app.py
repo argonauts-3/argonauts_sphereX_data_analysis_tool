@@ -1,0 +1,392 @@
+"""Flask server for the SPHEREx time-series explorer.
+
+The app is deliberately thin.  All the astronomy is in test.py, the dataset
+building and PNG rendering is in dataset.py, and this file only does:
+
+    * validate what the page asks for,
+    * run one build at a time in a worker thread (downloads are slow),
+    * serve the manifest, the frame PNGs and the difference images.
+
+Run it with:
+
+    .venv/bin/python app.py
+    # then open http://127.0.0.1:5000
+
+Everything the page needs is also accepted as URL parameters, e.g.
+
+    /?name=Barnard%27s%20Star&fov=0.3&t0=2025-05-01&bands=D5&play=1
+    /?ra=133.818908&dec=-7.247048&fov=0.2&embed=1
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import threading
+import traceback
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import numpy as np
+from astropy import units as u
+from astropy.time import Time
+from flask import Flask, jsonify, request, send_file, send_from_directory
+from PIL import Image
+
+import dataset
+import test as pipeline
+
+REPO = Path(__file__).resolve().parent
+STATIC = REPO / "static"
+DATA_ROOT = dataset.DATA_ROOT
+
+# One build at a time.  Each build can download a gigabyte, so two at once
+# would only make both slower and hammer the archive.
+EXECUTOR = ThreadPoolExecutor(max_workers=1)
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+
+ID_RE = re.compile(r"^[0-9a-f]{12}$")
+
+# Small curated list for the drop-down.  Proper motions are included only
+# where they are well known; the rest are slow enough to be irrelevant over
+# the one-year archive baseline.  "pm" is [pm_ra_cosdec, pm_dec] in mas/yr.
+TARGETS = [
+    {
+        "name": "WISE 0855-0714",
+        "query": "WISE J085510.83-071442.5",
+        "ra": 133.818908,
+        "dec": -7.247048,
+        "pm": [-8123.7, 673.2],
+        "note": "coldest known brown dwarf, very red",
+    },
+    {
+        "name": "Barnard's Star",
+        "query": "Barnard's Star",
+        "ra": 269.452077,
+        "dec": 4.693365,
+        "pm": [-798.71, 10337.77],
+        "note": "fastest proper motion of any star",
+    },
+    {
+        "name": "Epsilon Indi B",
+        "query": "Epsilon Indi B",
+        "ra": 331.044147,
+        "dec": -56.782844,
+        "pm": [3960.9, -2539.2],
+        "note": "T dwarf companion, 7 arcmin from Epsilon Indi A",
+    },
+    {
+        "name": "RW Aurigae",
+        "query": "RW Aurigae",
+        "ra": 76.956526,
+        "dec": 30.401438,
+        "pm": [0.0, 0.0],
+        "note": "young star with deep eclipses",
+    },
+    {
+        "name": "R Draconis",
+        "query": "R Draconis",
+        "ra": 248.167611,
+        "dec": 66.754979,
+        "pm": [0.0, 0.0],
+        "note": "Mira variable, large brightness changes",
+    },
+]
+
+app = Flask(__name__, static_folder=str(STATIC), static_url_path="/static")
+
+
+# ==========================================================================
+# Request parsing
+# ==========================================================================
+
+def _band_list(items):
+    """Accept 'D5', 'SPHEREx-D5' or a mixed list; return full band names."""
+    if not items:
+        return list(pipeline.BANDS)
+    out = []
+    for item in items:
+        item = str(item).strip()
+        full = item if item in pipeline.BANDS else f"SPHEREx-{item.upper()}"
+        if full not in pipeline.BANDS:
+            raise ValueError(f"unknown band: {item}")
+        if full not in out:
+            out.append(full)
+    return out
+
+
+def _match_curated(ra_deg, dec_deg):
+    """The curated entry at these coordinates, if any (for its proper motion)."""
+    for target in TARGETS:
+        if abs(target["ra"] - ra_deg) < 3e-4 and abs(target["dec"] - dec_deg) < 3e-4:
+            return target
+    return None
+
+
+def parse_build_request(data):
+    """Turn JSON from the page into the arguments of dataset.build_dataset."""
+    if not isinstance(data, dict):
+        raise ValueError("expected a JSON object")
+
+    name = (data.get("name") or "").strip()
+    ra = data.get("ra")
+    dec = data.get("dec")
+
+    if ra is None or dec is None:
+        if not name:
+            raise ValueError("give a target name or ra/dec")
+        coord = pipeline.resolve_name(name)
+        ra_deg, dec_deg = coord.ra.deg, coord.dec.deg
+        curated = next(
+            (t for t in TARGETS if t["query"].lower() == name.lower()
+             or t["name"].lower() == name.lower()), None)
+    else:
+        try:
+            ra_deg, dec_deg = float(ra), float(dec)
+        except (TypeError, ValueError):
+            raise ValueError("ra and dec must be numbers in degrees")
+        if not (0.0 <= ra_deg < 360.0 and -90.0 <= dec_deg <= 90.0):
+            raise ValueError("ra must be 0..360 and dec -90..90")
+        curated = _match_curated(ra_deg, dec_deg)
+
+    pm = curated["pm"] if curated else [0.0, 0.0]
+    label = curated["name"] if curated else (name or "custom field")
+
+    try:
+        fov = float(data.get("fov", 0.3))
+    except (TypeError, ValueError):
+        raise ValueError("fov must be a number in degrees")
+    if not 0.1 <= fov <= 1.0:
+        raise ValueError("fov must be between 0.1 and 1.0 degrees")
+    fov = round(fov, 3)
+
+    t0 = (data.get("t0") or "").strip() or None
+    t1 = (data.get("t1") or "").strip() or None
+    try:
+        if t0:
+            Time(t0)
+        if t1:
+            Time(t1)
+        if t0 and t1 and Time(t0) > Time(t1):
+            raise ValueError("start date is after end date")
+    except ValueError:
+        raise
+    except Exception:
+        raise ValueError("dates must look like 2026-01-31")
+
+    bands = _band_list(data.get("bands"))
+
+    return {
+        "name": label,
+        "ra": ra_deg,
+        "dec": dec_deg,
+        "fov": fov,
+        "t0": t0,
+        "t1": t1,
+        "bands": bands,
+        "track": bool(data.get("track", False)),
+        "pm": pm,
+    }
+
+
+def public_params(params):
+    """The part of a parsed request that belongs in a shareable URL."""
+    return {
+        "name": params["name"],
+        "ra": params["ra"],
+        "dec": params["dec"],
+        "fov": params["fov"],
+        "t0": params["t0"],
+        "t1": params["t1"],
+        "bands": [b[-2:] for b in params["bands"]],
+        "track": params["track"],
+    }
+
+
+# ==========================================================================
+# Build jobs
+# ==========================================================================
+
+def _set_job(key, **fields):
+    with JOBS_LOCK:
+        job = JOBS.setdefault(key, {})
+        job.update(fields)
+
+
+def _run_build(key, params):
+    def progress(stage, done, total):
+        _set_job(key, stage=stage, done=int(done), total=int(total))
+
+    _set_job(key, state="running", stage="query", done=0, total=0, error=None)
+    try:
+        dataset.build_dataset(
+            params["ra"], params["dec"], key, params["fov"],
+            params["t0"], params["t1"], params["bands"],
+            track=params["track"],
+            proper_motion=(params["pm"][0] * u.mas / u.yr,
+                           params["pm"][1] * u.mas / u.yr),
+            progress=progress,
+        )
+        _set_job(key, state="ready", stage="ready", error=None,
+                 done=1, total=1)
+    except Exception as exc:                    # noqa: BLE001 - report to the page
+        traceback.print_exc()
+        _set_job(key, state="error", stage="error", error=str(exc))
+        # A failed build leaves no manifest; do not keep its half-written
+        # frames around pretending to be a dataset.
+        dataset.remove_dataset(key)
+
+
+# ==========================================================================
+# Routes
+# ==========================================================================
+
+@app.get("/")
+def index():
+    return send_from_directory(STATIC, "index.html")
+
+
+@app.get("/api/targets")
+def api_targets():
+    return jsonify([{k: t[k] for k in ("name", "ra", "dec", "pm", "note")}
+                    for t in TARGETS])
+
+
+@app.get("/api/resolve")
+def api_resolve():
+    name = (request.args.get("name") or "").strip()
+    if not name:
+        return jsonify(error="missing name"), 400
+    try:
+        coord = pipeline.resolve_name(name)
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 404
+    return jsonify(ra=coord.ra.deg, dec=coord.dec.deg)
+
+
+@app.post("/api/build")
+def api_build():
+    try:
+        params = parse_build_request(request.get_json(force=True, silent=True))
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+
+    key = dataset.dataset_id(params["ra"], params["dec"], params["fov"],
+                             params["t0"], params["t1"], params["bands"],
+                             params["track"])
+    manifest = DATA_ROOT / key / "manifest.json"
+    if manifest.exists():
+        return jsonify(id=key, state="ready", params=public_params(params))
+
+    with JOBS_LOCK:
+        job = JOBS.get(key)
+        # No job, a failed job, or a "ready" job whose directory was deleted:
+        # all of those need a new build.  A queued/running job is left alone.
+        if job is None or job.get("state") in ("error", "ready"):
+            JOBS[key] = {"state": "queued", "stage": "queued",
+                         "done": 0, "total": 0, "error": None}
+            EXECUTOR.submit(_run_build, key, params)
+    return jsonify(id=key, state="queued", params=public_params(params))
+
+
+@app.get("/api/job/<key>")
+def api_job(key):
+    if not ID_RE.match(key):
+        return jsonify(error="bad dataset id"), 400
+    if (DATA_ROOT / key / "manifest.json").exists():
+        return jsonify(id=key, state="ready")
+    with JOBS_LOCK:
+        job = dict(JOBS.get(key, {}))
+    if not job:
+        return jsonify(error="unknown dataset"), 404
+    return jsonify(id=key, **job)
+
+
+@app.get("/api/dataset/<key>")
+def api_dataset(key):
+    if not ID_RE.match(key):
+        return jsonify(error="bad dataset id"), 400
+    return send_from_directory(DATA_ROOT / key, "manifest.json")
+
+
+@app.get("/data/<key>/<path:filename>")
+def api_file(key, filename):
+    if not ID_RE.match(key):
+        return jsonify(error="bad dataset id"), 400
+    return send_from_directory(DATA_ROOT / key, filename)
+
+
+@app.get("/api/diff/<key>")
+def api_diff(key):
+    """Quick-look A-B or (A+B)/2 from two rendered frames.
+
+    The arithmetic is done on the displayed 8-bit values, not the original
+    float images: the page only has the PNGs, and at ~2 uJy per grey level the
+    quantisation is below the per-pixel noise.  This is a visual tool, not a
+    photometric measurement; flux values stay in the manifest.
+    """
+    if not ID_RE.match(key):
+        return jsonify(error="bad dataset id"), 400
+    try:
+        a = int(request.args.get("a"))
+        b = int(request.args.get("b"))
+    except (TypeError, ValueError):
+        return jsonify(error="a and b must be frame numbers"), 400
+    mode = request.args.get("mode", "sub")
+    if mode not in ("sub", "add"):
+        return jsonify(error="mode must be sub or add"), 400
+
+    manifest_path = DATA_ROOT / key / "manifest.json"
+    if not manifest_path.exists():
+        return jsonify(error="dataset not built"), 404
+    manifest = json.loads(manifest_path.read_text())
+    frames = manifest["frames"]
+    if not (0 <= a < len(frames) and 0 <= b < len(frames)):
+        return jsonify(error="frame number out of range"), 400
+    if frames[a]["band"] != frames[b]["band"]:
+        return jsonify(error="pick two frames from the same detector: a "
+                             "difference between bands is not a difference image"), 400
+
+    cache = DATA_ROOT / key / f"diff_{mode}_{a:03d}_{b:03d}.png"
+    if not cache.exists():
+        def grey(index):
+            path = DATA_ROOT / key / frames[index]["png"]
+            return np.asarray(Image.open(path).convert("L"), dtype=np.float32) / 255.0
+
+        first, second = grey(a), grey(b)
+        covered = (first > 0) & (second > 0)          # 0 is the "no data" value
+
+        if mode == "sub":
+            data = first - second
+            values = data[covered]
+            sigma = 1.4826 * float(np.median(np.abs(values - np.median(values)))) \
+                if values.size else 0.0
+            scale = max(3.0 * sigma, 1e-6)
+            v = np.clip(data / scale, -1.0, 1.0)
+            rgb = np.empty(data.shape + (3,), dtype=np.uint8)
+            # Blue = A fainter than B, white = same, red = A brighter than B.
+            neg = v < 0
+            rgb[..., 0] = np.where(neg, 1.0 + v, 1.0) * 255
+            rgb[..., 1] = np.where(neg, 1.0 + v, 1.0 - v) * 255
+            rgb[..., 2] = np.where(neg, 1.0, 1.0 - v) * 255
+        else:
+            data = 0.5 * (first + second)
+            values = data[covered]
+            lo, hi = np.percentile(values, [1, 99.5]) if values.size else (0, 1)
+            scaled = np.clip((data - lo) / max(hi - lo, 1e-6), 0, 1)
+            grey = 1 + scaled * 254
+            rgb = np.repeat(grey[..., None], 3, axis=2).astype(np.uint8)
+
+        rgb[~covered] = 0
+        Image.fromarray(rgb).save(cache, optimize=True)
+
+    return send_file(cache, mimetype="image/png")
+
+
+if __name__ == "__main__":
+    host = os.environ.get("HOST", "127.0.0.1")
+    port = int(os.environ.get("PORT", "5000"))
+    print(f"open http://{host}:{port}")
+    app.run(host=host, port=port, threaded=True)

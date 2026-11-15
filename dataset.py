@@ -38,6 +38,9 @@ REPO = Path(__file__).resolve().parent
 DATA_ROOT = REPO / "data"
 CUTOUT_ROOT = REPO / "cutout_cache"
 
+# One build should stay a few gigabytes at most.
+MAX_EXPOSURES = 500
+
 BAND_SHORT = {band: band[-2:] for band in pipeline.BANDS}
 
 # Cutouts are downloaded at a few fixed sizes.  The archive cutout is a
@@ -237,6 +240,16 @@ def build_dataset(ra_deg, dec_deg, dataset_key, fov_deg, t0, t1, bands,
     if not bands_present:
         raise RuntimeError("no exposures in the selected bands")
 
+    # Safety net: a position near the galactic plane can return thousands of
+    # exposures, and every one is a multi-megabyte download.  Refuse clearly
+    # rather than fill the disk; the user can pick a shorter date range.
+    n_planned = int(sum(np.sum(exposures["energy_bandpassname"] == b)
+                        for b in bands_present))
+    if n_planned > MAX_EXPOSURES:
+        raise RuntimeError(
+            f"{n_planned} exposures match; narrow the date range or pick "
+            f"fewer detectors (limit is {MAX_EXPOSURES})")
+
     # --- 2. Download and measure ------------------------------------------
     cutout_size = fetch_tier(fov_deg)
     report("downloading", 0, len(exposures))
@@ -250,7 +263,8 @@ def build_dataset(ra_deg, dec_deg, dataset_key, fov_deg, t0, t1, bands,
     frames = pipeline.download_frames(
         exposures, bands_present, target, reference, cutout_size,
         max_frames=max_frames, cutout_dir=CUTOUT_ROOT,
-        proper_motion=proper_motion, progress=download_progress)
+        proper_motion=proper_motion, progress=download_progress,
+        measure_progress=lambda done, total: report("measuring", done, total))
     if not frames:
         raise RuntimeError("no cutouts could be retrieved (the archive refused "
                            "every exposure)")

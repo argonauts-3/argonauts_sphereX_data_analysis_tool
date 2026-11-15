@@ -746,7 +746,7 @@ def load_frame(row, band, target, reference, cutout_size_deg,
 
 def download_frames(exposures, bands_present, target, reference, cutout_size_deg,
                     max_frames=None, workers=None, cutout_dir=None,
-                    proper_motion=None, progress=None):
+                    proper_motion=None, progress=None, measure_progress=None):
     """Load frames for every band, oldest exposures first.
 
     `max_frames` caps the exposures per band (None = all).  `progress` is
@@ -768,6 +768,7 @@ def download_frames(exposures, bands_present, target, reference, cutout_size_deg
                               cutout_dir=cutout_dir, progress=progress)
 
     frames = []
+    total_rows = sum(len(rows) for _, rows in plan)
     for band, rows in plan:
         print(f"\n{band}: {len(rows)} frames")
         for row in rows:
@@ -778,6 +779,8 @@ def download_frames(exposures, bands_present, target, reference, cutout_size_deg
                                cutout_dir=cutout_dir)
             if frame is not None:
                 frames.append(frame)
+            if measure_progress is not None:
+                measure_progress(len(frames), total_rows)
 
     frames.sort(key=lambda f: (f.band, f.mjd))
     return frames
