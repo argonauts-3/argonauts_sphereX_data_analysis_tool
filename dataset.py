@@ -230,6 +230,8 @@ def build_dataset(ra_deg, dec_deg, dataset_key, fov_deg, t0, t1, bands,
         # --- 1. Which exposures cover this position? --------------------------
         report("query", 0, 1)
         position_now = pipeline.target_position_at(target, Time.now(), proper_motion)
+        # Ensure the cutout cache directory exists before writing
+        CUTOUT_ROOT.mkdir(parents=True, exist_ok=True)
         sia_path = CUTOUT_ROOT / f"exposures_{ra:.3f}_{dec:.3f}.ecsv".replace("-", "m")
         exposures = pipeline.get_exposures(position_now, pipeline.SEARCH_RADIUS_DEG,
                                            sia_path)

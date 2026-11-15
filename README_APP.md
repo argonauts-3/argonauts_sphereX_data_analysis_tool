@@ -79,13 +79,13 @@ Everything is cached afterwards:
 
 The current view is always in the URL, so it can be shared or embedded:
 
-```
+```text
 /?name=Barnard%27s%20Star&fov=0.3&t0=2025-05-01&bands=D5&fps=6&play=1
 /?ra=133.818908&dec=-7.247048&fov=0.2&embed=1
 ```
 
 | parameter | meaning |
-|---|---|
+| --- | --- |
 | `name` | target name; curated names use their built-in coordinates, others are resolved with Sesame |
 | `ra`, `dec` | J2000 coordinates in degrees (take precedence over `name`) |
 | `fov` | field of view in degrees, 0.1 to 1.0 |
