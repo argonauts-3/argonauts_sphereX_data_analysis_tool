@@ -245,14 +245,19 @@ function requestFromForm() {
     request.ra = target.ra;
     request.dec = target.dec;
   } else {
-    request.name = $("nameInput").value.trim() || "custom field";
+    const name = $("nameInput").value.trim();
     const ra = parseFloat($("raInput").value);
     const dec = parseFloat($("decInput").value);
-    if (!Number.isFinite(ra) || !Number.isFinite(dec)) {
-      throw new Error("Enter RA and Dec in degrees, or pick a target.");
+    if (Number.isFinite(ra) && Number.isFinite(dec)) {
+      request.name = name || "custom field";
+      request.ra = ra;
+      request.dec = dec;
+    } else if (name) {
+      // The server resolves the name with Sesame and returns the coordinates.
+      request.name = name;
+    } else {
+      throw new Error("Enter a target name, or RA and Dec in degrees.");
     }
-    request.ra = ra;
-    request.dec = dec;
   }
   return request;
 }
@@ -313,7 +318,11 @@ async function startBuild(request) {
   const token = ++state.buildToken;
   pause();
   backToMovie(true);
+  // Keep the current frame across a rebuild (FOV or date change); a brand-new
+  // target just starts at frame 0 because there is no old frame list yet.
+  if (state.frames.length) state.wantFrame = state.index;
   state.params = params;
+  syncURL();
   $("compareMsg").textContent =
     "Same detector only: a difference between bands is not a difference image.";
   $("compareMsg").classList.remove("error");
@@ -335,6 +344,10 @@ async function startBuild(request) {
     if (!Number.isFinite(state.params.ra) && Number.isFinite(response.params.ra)) {
       state.params.ra = response.params.ra;
       state.params.dec = response.params.dec;
+      // A name-only request was resolved by the server; show the result so
+      // the form and the next shareable URL have the coordinates too.
+      $("raInput").value = response.params.ra.toFixed(6);
+      $("decInput").value = response.params.dec.toFixed(6);
     }
   }
 

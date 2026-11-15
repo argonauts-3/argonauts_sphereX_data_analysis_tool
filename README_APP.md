@@ -23,14 +23,17 @@ PORT=8080 HOST=0.0.0.0 .venv/bin/python app.py
 ```
 
 The first visit to a new position downloads one cutout per exposure.  At the
-default 0.3 degree field that is about 1.3 GB and a minute or two; the page
-shows progress.  Everything is cached afterwards:
+default 0.3 degree field that is about 1.3 GB and 10-20 minutes on a slow
+link; the page shows progress.  Larger fields cost more: about 4.5 GB at 1.0
+degree.  Everything is cached afterwards:
 
 - `cutout_cache/` - the archive cutouts, keyed by the cutout URL.  Shared by
   the app and `test.py`, and reused when you change the date range.
 - `data/<id>/` - one built dataset: `manifest.json` plus one PNG per frame.
-  Changing only the dates or the field of view rebuilds this from the cache in
-  a few seconds.
+  Changing the dates rebuilds this from the cache in a few seconds.  Changing
+  the field of view does too, as long as the new field still fits inside the
+  same downloaded cutout size (the tiers are 0.3, 0.5, 0.8, 1.0 and 1.5
+  degrees).
 
 ## The page
 
@@ -94,6 +97,29 @@ values, estimates the scatter from the difference itself (MAD) and stretches
 to +/- 3 sigma.  At the default field one grey level is about 2 uJy, below the
 per-pixel noise, so this is a visual quick-look; use `flux_ujy` in the
 manifest for measurements.
+
+## Adding a new data release
+
+IRSA publishes each SPHEREx release as a SIA collection.  Add its id to the
+list in `test.py`:
+
+```python
+COLLECTIONS = ("spherex_dr1", "spherex_qr3", "spherex_dr2")
+```
+
+Nothing else changes: the query stacks every collection into one exposure
+list, so new frames appear in the same movie.  If the manifest gains a field,
+bump `dataset.VERSION`; it is part of the dataset id, so old cached datasets
+are rebuilt instead of being served with a page that expects something else.
+
+## Not in this prototype
+
+- No pixel-level spectrum or wavelength slider.  Wavelength is shown per
+  frame in the table and metadata, but each view is one detector at a time.
+- No measured light curve or period search; the flux column is per exposure.
+- No pan/zoom beyond the browser's own image scaling.  The field is fixed by
+  the FOV control.
+- No user accounts or server-side persistence.  The URL is the whole state.
 
 ## Caveats worth knowing
 

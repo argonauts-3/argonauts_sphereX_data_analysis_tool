@@ -821,12 +821,17 @@ def shifted_wcs(wcs, shift_ra_deg, shift_dec_deg):
     return shifted
 
 
-def align_frames(frames, ra, dec, fov_deg=None, track=True):
+def align_frames(frames, ra, dec, fov_deg=None, track=True,
+                 release_source=False):
     """Resample every frame onto one common grid (stored in frame.*_aligned).
 
     `track=True` shifts each frame so the moving target stays at the centre.
     `track=False` keeps the grid fixed on the sky, which is what you want to
     watch everything move (including the target).
+
+    `release_source=True` drops the full cutout arrays after each frame has
+    been reprojected.  The web app renders from `image_aligned` only, so this
+    keeps a 272-exposure build from holding two copies of every cutout.
     """
     fov_deg = FIELD_OF_VIEW_DEG if fov_deg is None else fov_deg
     out_wcs, n = north_up_wcs(ra, dec, fov_deg)
@@ -846,6 +851,12 @@ def align_frames(frames, ra, dec, fov_deg=None, track=True):
             (frame.flags, wcs), out_wcs, shape_out=(n, n), order="nearest-neighbor")
         # Pixels outside the footprint are NaN, which would cast to garbage.
         frame.flags_aligned = np.nan_to_num(flags_float, nan=0.0).round().astype(np.int32)
+
+        if release_source:
+            frame.image = None
+            frame.variance = None
+            frame.flags = None
+            frame.wcs = None
 
     fully_covered = [f for f in frames if f.footprint.mean() > 0.99]
     print(f"{len(fully_covered)}/{len(frames)} frames fully cover the output grid")

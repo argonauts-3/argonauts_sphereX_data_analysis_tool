@@ -138,7 +138,7 @@ def parse_build_request(data):
         if not name:
             raise ValueError("give a target name or ra/dec")
         coord = pipeline.resolve_name(name)
-        ra_deg, dec_deg = coord.ra.deg, coord.dec.deg
+        ra_deg, dec_deg = float(coord.ra.deg), float(coord.dec.deg)
         curated = next(
             (t for t in TARGETS if t["query"].lower() == name.lower()
              or t["name"].lower() == name.lower()), None)
@@ -195,8 +195,8 @@ def public_params(params):
     """The part of a parsed request that belongs in a shareable URL."""
     return {
         "name": params["name"],
-        "ra": params["ra"],
-        "dec": params["dec"],
+        "ra": float(params["ra"]),
+        "dec": float(params["dec"]),
         "fov": params["fov"],
         "t0": params["t0"],
         "t1": params["t1"],
@@ -263,7 +263,7 @@ def api_resolve():
         coord = pipeline.resolve_name(name)
     except ValueError as exc:
         return jsonify(error=str(exc)), 404
-    return jsonify(ra=coord.ra.deg, dec=coord.dec.deg)
+    return jsonify(ra=float(coord.ra.deg), dec=float(coord.dec.deg))
 
 
 @app.post("/api/build")
