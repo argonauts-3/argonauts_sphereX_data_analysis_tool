@@ -2,10 +2,15 @@
  *
  * The server has already aligned every exposure onto one north-up grid and
  * rendered it to a PNG, so this file only has to:
- *   - ask for a dataset, poll the build progress,
- *   - preload the PNGs and swap one <img> at the requested rate,
+ *   - ask for a dataset, poll the build progress and show a preview early,
+ *   - preload the PNGs and draw one canvas frame at the requested rate,
+ *   - let the user choose the display interpolation kernel,
  *   - show the metadata that comes with each frame,
  *   - ask the server for an A-B or (A+B)/2 image.
+ *
+ * Changing the target, field, dates, detectors or alignment only marks the
+ * form as modified.  Pressing Show (or Enter) applies the settings and starts
+ * a build.  Playback controls are immediate.
  *
  * No frameworks, no build step.
  */
@@ -15,6 +20,7 @@
 const BANDS = ["SPHEREx-D1", "SPHEREx-D2", "SPHEREx-D3",
                "SPHEREx-D4", "SPHEREx-D5", "SPHEREx-D6"];
 const BAND_SHORT = Object.fromEntries(BANDS.map(b => [b, b.slice(-2)]));
+const INTERP_MODES = ["nearest", "bilinear", "bicubic", "lanczos", "gaussian"];
 const STAGE_LABEL = {
   queued: "Queued",
   query: "Searching the archive",
@@ -22,7 +28,10 @@ const STAGE_LABEL = {
   measuring: "Measuring frames",
   aligning: "Aligning frames",
   rendering: "Rendering images",
+  preview: "Preview ready",
   loading: "Loading images into the browser",
+  cancelling: "Cancelling",
+  cancelled: "Cancelled",
   ready: "Ready",
 };
 
@@ -34,14 +43,19 @@ const state = {
   datasetId: null,
   manifest: null,
   frames: [],
+  images: new Map(),   // frame URL -> loaded HTMLImageElement
   index: 0,
   fps: 4,
   playing: false,
   timer: null,
   buildToken: 0,
+  jobId: null,
   mode: "movie",       // or "diff"
   wantFrame: null,
   wantPlay: false,
+  interp: "bilinear",
+  viewer: null,
+  dirty: false,
 };
 
 // --------------------------------------------------------------------------
@@ -53,6 +67,9 @@ init();
 async function init() {
   const query = new URLSearchParams(location.search);
   if (query.get("embed") === "1") document.body.classList.add("embed");
+
+  state.interp = normaliseInterp(query.get("interp"));
+  setupViewer(query.get("viewer") === "2d");
 
   $("targetSelect").innerHTML =
     '<option value="custom">Custom RA / Dec or name</option>';
@@ -73,6 +90,8 @@ async function init() {
 
   buildBandCheckboxes();
   wireControls();
+
+  if (query.get("guide") === "1") openGuide();
 
   const params = paramsFromQuery(query);
   if (params) {
@@ -110,28 +129,37 @@ function buildBandCheckboxes() {
 }
 
 // --------------------------------------------------------------------------
-// Controls.  Every numeric control is a slider paired with a number input:
-// dragging updates the number, typing updates the slider.
+// Reusable sliders.  Declared once here, mounted wherever the page has a
+// [data-slider="name"] element.
 // --------------------------------------------------------------------------
 
-function linkPair(rangeId, numberId, commit) {
-  const range = $(rangeId);
-  const number = $(numberId);
-
-  range.addEventListener("input", () => { number.value = range.value; });
-  range.addEventListener("change", () => {
-    number.value = range.value;
-    commit(parseFloat(range.value));
+function registerSliders() {
+  SliderControls.register("fov", {
+    label: "Field of view",
+    min: 0.1, max: 1, step: 0.05, value: 0.3,
+    unit: "deg", precision: 2,
+    hint: "Bigger fields download more archive data: about 1.3 GB at 0.3 deg "
+        + "and 4.5 GB at 1.0 deg. Cached after the first view.",
+    // Dragging does not rebuild the images; it only marks the form dirty.
+    onCommit: markDirty,
   });
 
-  number.addEventListener("change", () => {
-    let value = parseFloat(number.value);
-    if (!Number.isFinite(value)) value = parseFloat(range.value);
-    value = Math.min(Math.max(value, parseFloat(number.min)), parseFloat(number.max));
-    number.value = value;
-    range.value = value;
-    commit(value);
+  SliderControls.register("fps", {
+    label: "fps",
+    min: 0.5, max: 12, step: 0.5, value: 4,
+    precision: 1,
+    onCommit: changePlaybackRate,
   });
+
+  SliderControls.register("frame", {
+    label: "Frame",
+    min: 0, max: 0, step: 1, value: 0,
+    precision: 0,
+    onInput: pauseAndSetIndex,
+    onCommit: pauseAndSetIndex,
+  });
+
+  SliderControls.mountAll();
 }
 
 function wireControls() {
@@ -148,17 +176,18 @@ function wireControls() {
       $("nameInput").focus();
     } else {
       selectTarget(name);
-      applyForm();
     }
+    markDirty();
   });
 
-  // Typing a name or coordinate is itself a request for a custom target.
+  // Typing a name or coordinate is itself a change to the request.
   $("nameInput").addEventListener("input", () => {
     useCustomTarget();
     // A new name means a new position.  Clearing the old coordinates stops
     // them from silently overriding the name the user just typed.
     $("raInput").value = "";
     $("decInput").value = "";
+    markDirty();
   });
 
   for (const id of ["raInput", "decInput"]) {
@@ -170,27 +199,19 @@ function wireControls() {
       if (state.targets.some(target => target.name === name)) {
         $("nameInput").value = "";
       }
+      markDirty();
     });
   }
 
-  linkPair("fovRange", "fovNumber", () => applyForm());
-  linkPair("fpsRange", "fpsNumber", value => {
-    state.fps = value;
-    if (state.playing) {
-      pause();
-      play();
-    }
-    syncURL();
-  });
-  linkPair("frameRange", "frameNumber", value => {
-    pause();
-    setIndex(value);
+  for (const id of ["t0Input", "t1Input"]) {
+    $(id).addEventListener("change", markDirty);
+  }
+
+  document.querySelectorAll('input[name="band"]').forEach(input => {
+    input.addEventListener("change", markDirty);
   });
 
-  $("frameRange").addEventListener("input", () => {
-    pause();
-    setIndex(parseInt($("frameRange").value, 10));
-  });
+  registerSliders();
 
   $("playBtn").addEventListener("click", () => {
     if (state.mode === "diff") return;
@@ -214,11 +235,11 @@ function wireControls() {
         $("t0Input").value = `${preset}-01-01`;
         $("t1Input").value = `${preset}-12-31`;
       }
-      applyForm();
+      markDirty();
     });
   });
 
-  $("trackInput").addEventListener("change", () => applyForm());
+  $("trackInput").addEventListener("change", markDirty);
 
   $("frameRows").addEventListener("click", event => {
     const row = event.target.closest("tr[data-i]");
@@ -227,14 +248,105 @@ function wireControls() {
     setIndex(parseInt(row.dataset.i, 10));
   });
 
+  $("interpSelect").addEventListener("change", () => {
+    if (!setInterp($("interpSelect").value)) {
+      $("interpSelect").value = state.interp;
+    }
+  });
+
+  $("cancelBtn").addEventListener("click", cancelBuild);
+  $("guideBtn").addEventListener("click", openGuide);
+  $("guideCloseBtn").addEventListener("click", closeGuide);
+  $("guideDialog").addEventListener("close", () => {
+    $("guideBtn").focus();
+    const url = new URL(location.href);
+    if (url.searchParams.get("guide") === "1") {
+      url.searchParams.delete("guide");
+      history.replaceState(null, "", url);
+    }
+  });
+
   document.addEventListener("keydown", event => {
     const tag = (event.target.tagName || "").toLowerCase();
     if (["input", "select", "textarea", "button"].includes(tag)) return;
     if (event.key === " ") { event.preventDefault(); state.playing ? pause() : play(); }
     if (event.key === "ArrowRight") { pause(); setIndex(state.index + 1); }
     if (event.key === "ArrowLeft") { pause(); setIndex(state.index - 1); }
+    if (event.key === "g" || event.key === "G") openGuide();
   });
 }
+
+function markDirty() {
+  state.dirty = true;
+  const button = $("showBtn");
+  button.textContent = "Show changes";
+  button.classList.add("dirty");
+  $("dirtyHint").hidden = false;
+}
+
+function clearDirty() {
+  state.dirty = false;
+  const button = $("showBtn");
+  button.textContent = "Show";
+  button.classList.remove("dirty");
+  $("dirtyHint").hidden = true;
+}
+
+// --------------------------------------------------------------------------
+// Display interpolation (display only; never touches measurements)
+// --------------------------------------------------------------------------
+
+function normaliseInterp(name) {
+  return INTERP_MODES.includes(name) ? name : "bilinear";
+}
+
+function setupViewer(force2d) {
+  state.viewer = createFrameViewer($("view"), {
+    defaultKernel: state.interp,
+    force2d,
+  });
+
+  const select = $("interpSelect");
+  for (const option of select.options) {
+    const ok = state.viewer.supports(option.value);
+    option.disabled = !ok;
+    option.title = ok ? "" : "Requires WebGL";
+  }
+
+  if (!state.viewer.supports(state.interp)) state.interp = "bilinear";
+  select.value = state.interp;
+  state.viewer.setKernel(state.interp);
+  $("viewerNotice").hidden = state.viewer.mode !== "2d";
+}
+
+function setInterp(name) {
+  const wanted = normaliseInterp(name);
+  if (!state.viewer.supports(wanted)) return false;
+  state.interp = wanted;
+  state.viewer.setKernel(wanted);
+  $("interpSelect").value = wanted;
+  syncURL();
+  return true;
+}
+
+// --------------------------------------------------------------------------
+// User guide dialog
+// --------------------------------------------------------------------------
+
+function openGuide() {
+  const dialog = $("guideDialog");
+  if (!dialog || dialog.open) return;
+  dialog.showModal();
+}
+
+function closeGuide() {
+  const dialog = $("guideDialog");
+  if (dialog && dialog.open) dialog.close();
+}
+
+// --------------------------------------------------------------------------
+// Target helpers
+// --------------------------------------------------------------------------
 
 function useCustomTarget() {
   if ($("targetSelect").value !== "custom") {
@@ -257,8 +369,9 @@ function requestFromForm() {
     .map(input => input.value);
   if (bands.length === 0) throw new Error("Pick at least one detector.");
 
+  const fov = SliderControls.get("fov")?.value ?? parseFloat($("fovNumber").value);
   const request = {
-    fov: parseFloat($("fovNumber").value),
+    fov,
     t0: $("t0Input").value || null,
     t1: $("t1Input").value || null,
     bands,
@@ -307,8 +420,8 @@ function fillForm(params) {
     $("decInput").value = Number.isFinite(params.dec) ? params.dec : "";
   }
 
-  $("fovRange").value = $("fovNumber").value = params.fov ?? 0.3;
-  $("fpsRange").value = $("fpsNumber").value = state.fps;
+  SliderControls.get("fov")?.setValue(params.fov ?? 0.3, { silent: true });
+  SliderControls.get("fps")?.setValue(state.fps, { silent: true });
   $("t0Input").value = params.t0 || "";
   $("t1Input").value = params.t1 || "";
 
@@ -346,16 +459,19 @@ async function startBuild(request) {
   const token = ++state.buildToken;
   pause();
   backToMovie(true);
+  clearDirty();
   // Keep the current frame across a rebuild (FOV or date change); a brand-new
   // target just starts at frame 0 because there is no old frame list yet.
   if (state.frames.length) state.wantFrame = state.index;
   state.params = params;
+  state.jobId = null;
   syncURL();
   $("compareMsg").textContent =
     "Same detector only: a difference between bands is not a difference image.";
   $("compareMsg").classList.remove("error");
 
   showProgress("Starting build", null);
+  setCancelVisible(false);
 
   let response;
   try {
@@ -384,6 +500,10 @@ async function startBuild(request) {
     return;
   }
 
+  state.jobId = response.id;
+  setCancelVisible(true);
+  let previewLoaded = false;
+
   while (token === state.buildToken) {
     let job;
     try {
@@ -395,32 +515,154 @@ async function startBuild(request) {
     if (token !== state.buildToken) return;
 
     if (job.state === "ready") {
+      state.jobId = null;
+      setCancelVisible(false);
       await loadDataset(response.id, token);
       return;
     }
     if (job.state === "error") {
+      state.jobId = null;
+      setCancelVisible(false);
       showError(job.error || "The build failed.");
       return;
     }
-    const label = STAGE_LABEL[job.stage] || job.stage || "Working";
-    const behind = job.queued_behind;
-    let text = label + (job.total > 0 ? ` (${job.done}/${job.total})` : "");
-    let fraction = job.total > 0 ? job.done / job.total : null;
-    if (behind) {
-      // One build runs at a time.  Show that the queue is moving instead of
-      // leaving the user staring at an unexplained "Queued".
-      const behindLabel = STAGE_LABEL[behind.stage] || behind.stage || "working";
-      const field = Number.isFinite(behind.fov) ? `, ${behind.fov.toFixed(2)} deg` : "";
-      text = `Waiting for ${behind.name}${field}: ${behindLabel}` +
-             (behind.total > 0 ? ` (${behind.done}/${behind.total})` : "");
-      fraction = behind.total > 0 ? behind.done / behind.total : null;
+    if (job.state === "cancelled") {
+      state.jobId = null;
+      setCancelVisible(false);
+      if (state.manifest && state.manifest.complete === false) {
+        showProgress("Build cancelled. The preview remains available.", 0);
+      } else {
+        showError(job.error || "Build cancelled.");
+      }
+      return;
     }
-    showProgress(text, fraction);
+
+    // A partial manifest is written as soon as the preview band is rendered.
+    // Show it while the full build keeps running.
+    if (job.preview_ready && !previewLoaded) {
+      previewLoaded = true;
+      try {
+        await loadDataset(response.id, token, { preview: true, preserve: false });
+      } catch (err) {
+        showError(`Could not load the preview: ${err.message}`);
+      }
+      if (token !== state.buildToken) return;
+    }
+
+    if (job.state === "cancelling") {
+      showProgress("Cancelling...", null);
+      setCancelVisible(false);
+    } else {
+      const label = STAGE_LABEL[job.stage] || job.stage || "Working";
+      const behind = job.queued_behind;
+      let text = label + (job.total > 0 ? ` (${job.done}/${job.total})` : "");
+      let fraction = job.total > 0 ? job.done / job.total : null;
+      if (behind) {
+        // One build runs at a time.  Show that the queue is moving instead of
+        // leaving the user staring at an unexplained "Queued".
+        const behindLabel = STAGE_LABEL[behind.stage] || behind.stage || "working";
+        const field = Number.isFinite(behind.fov) ? `, ${behind.fov.toFixed(2)} deg` : "";
+        text = `Waiting for ${behind.name}${field}: ${behindLabel}` +
+               (behind.total > 0 ? ` (${behind.done}/${behind.total})` : "");
+        fraction = behind.total > 0 ? behind.done / behind.total : null;
+      }
+      showProgress(text, fraction);
+      setCancelVisible(true);
+    }
     await sleep(800);
   }
 }
 
-async function loadDataset(id, token) {
+async function cancelBuild() {
+  if (!state.jobId) return;
+  $("cancelBtn").disabled = true;
+  try {
+    await postJSON(`/api/job/${state.jobId}/cancel`, {});
+    showProgress("Cancelling...", null);
+    setCancelVisible(false);
+  } catch (err) {
+    $("cancelBtn").disabled = false;
+    showError(`Could not cancel: ${err.message}`);
+  }
+}
+
+function setCancelVisible(flag) {
+  const button = $("cancelBtn");
+  button.hidden = !flag;
+  button.disabled = false;
+}
+
+// --------------------------------------------------------------------------
+// Manifest and image loading
+// --------------------------------------------------------------------------
+
+function frameURL(frame) {
+  const version = state.manifest?.render_version;
+  return `/data/${state.datasetId}/${frame.png}` +
+         (version ? `?v=${encodeURIComponent(version)}` : "");
+}
+
+function diffURL(a, b, mode) {
+  const version = state.manifest?.render_version;
+  return `/api/diff/${state.datasetId}?a=${a}&b=${b}&mode=${mode}` +
+         (version ? `&v=${encodeURIComponent(version)}` : "");
+}
+
+function currentFrameKey() {
+  const frame = state.frames[state.index];
+  if (!frame) return null;
+  return { obs_id: frame.obs_id, band: frame.band, mjd: frame.mjd };
+}
+
+function indexMatching(frames, key) {
+  if (!key) return null;
+  let index = frames.findIndex(f => f.obs_id === key.obs_id && f.band === key.band);
+  if (index >= 0) return index;
+  // obs_id is not unique across detectors; a band match is preferred above.
+  index = frames.findIndex(f => f.obs_id === key.obs_id);
+  if (index >= 0) return index;
+  if (Number.isFinite(key.mjd)) {
+    let best = null;
+    let delta = Infinity;
+    frames.forEach((frame, i) => {
+      const distance = Math.abs(frame.mjd - key.mjd);
+      if (distance < delta) {
+        delta = distance;
+        best = i;
+      }
+    });
+    return best;
+  }
+  return null;
+}
+
+function applyManifest(manifest, options = {}) {
+  const previousKey = options.previousKey || null;
+  state.manifest = manifest;
+  state.frames = manifest.frames || [];
+  state.mode = "movie";
+
+  renderSummary(manifest);
+  renderTable(state.frames);
+  fillCompare(state.frames);
+  updatePreviewBanner(manifest);
+
+  const last = Math.max(0, state.frames.length - 1);
+  SliderControls.get("frame")?.setBounds(0, last);
+
+  let wanted = options.frame;
+  if (!Number.isInteger(wanted)) {
+    const matched = indexMatching(state.frames, previousKey);
+    if (matched !== null) wanted = matched;
+    else if (Number.isInteger(state.wantFrame)) wanted = state.wantFrame;
+    else wanted = 0;
+  }
+  state.wantFrame = null;
+
+  setIndex(Math.min(Math.max(wanted, 0), last));
+}
+
+async function loadDataset(id, token, options = {}) {
   let manifest;
   try {
     manifest = await getJSON(`/api/dataset/${id}`);
@@ -429,44 +671,44 @@ async function loadDataset(id, token) {
     return;
   }
   if (token !== state.buildToken) return;
+  if (!manifest.frames || !manifest.frames.length) {
+    showError("The dataset has no frames yet.");
+    return;
+  }
 
+  const previousKey = options.preserve === false ? null : currentFrameKey();
   state.datasetId = id;
-  state.manifest = manifest;
-  state.frames = manifest.frames;
-  state.mode = "movie";
-
-  renderSummary(manifest);
-  renderTable(manifest.frames);
-  fillCompare(manifest.frames);
-  $("frameRange").max = Math.max(0, manifest.frames.length - 1);
-  $("frameNumber").max = Math.max(0, manifest.frames.length - 1);
+  state.images = new Map();
+  applyManifest(manifest, { previousKey, frame: options.frame });
 
   // Show a frame immediately, then load the rest in the background.  Waiting
   // for all 258 PNGs before drawing made the page feel much slower than it is.
-  const wanted = state.wantFrame;
-  state.wantFrame = null;
   const total = manifest.frames.length;
-  setIndex(Number.isInteger(wanted) && wanted >= 0 && wanted < total ? wanted : 0);
-  showProgress(`Loading images (0/${total})`, 0);
+  const urls = manifest.frames.map(frameURL);
+  const prefix = options.preview ? "Loading preview" : "Loading images";
+  showProgress(`${prefix} (0/${total})`, 0);
 
-  // Load every PNG once.  Blinking afterwards is then a pure swap with no
-  // network request, which is what makes the movie smooth.
-  let loaded = 0;
-  await Promise.all(manifest.frames.map(frame => new Promise(resolve => {
-    const image = new Image();
-    const done = () => {
-      loaded += 1;
-      if (token === state.buildToken &&
-          (loaded % 8 === 0 || loaded === total)) {
-        showProgress(`Loading images (${loaded}/${total})`, loaded / total);
-      }
-      resolve();
-    };
-    image.onload = done;
-    image.onerror = done;
-    image.src = `/data/${id}/${frame.png}`;
-  })));
+  // Load every PNG once.  Blinking afterwards is then a pure texture swap
+  // with no network request, which is what makes the movie smooth.
+  const images = await state.viewer.preload(urls, done => {
+    if (token === state.buildToken && (done % 8 === 0 || done === total)) {
+      showProgress(`${prefix} (${done}/${total})`, done / total);
+    }
+  });
   if (token !== state.buildToken) return;
+
+  state.images = images;
+  // The current frame may have been shown through showURL() before its
+  // preload finished; redraw it now that the map is complete.
+  setIndex(state.index);
+
+  if (options.preview) {
+    const planned = manifest.planned?.frames;
+    showProgress(
+      `Preview ready: ${manifest.frames.length} of ${planned ?? "?"} frames. ` +
+      "Still building the full dataset.", null);
+    return;
+  }
 
   hideProgress();
   if (state.wantPlay) {
@@ -476,9 +718,40 @@ async function loadDataset(id, token) {
   syncURL();
 }
 
+function updatePreviewBanner(manifest) {
+  const banner = $("previewBanner");
+  if (!manifest || manifest.complete !== false) {
+    banner.hidden = true;
+    banner.textContent = "";
+    return;
+  }
+  const band = manifest.preview_band
+    ? (BAND_SHORT[manifest.preview_band] || manifest.preview_band)
+    : "preview";
+  const planned = manifest.planned?.frames;
+  banner.hidden = false;
+  banner.textContent =
+    `Preview: ${band}, ${manifest.frames.length} of ${planned ?? "?"} frames ` +
+    "— building the other detectors";
+}
+
 // --------------------------------------------------------------------------
 // Playback
 // --------------------------------------------------------------------------
+
+function pauseAndSetIndex(value) {
+  pause();
+  setIndex(value);
+}
+
+function changePlaybackRate(value) {
+  state.fps = value;
+  if (state.playing) {
+    pause();
+    play();
+  }
+  syncURL();
+}
 
 function play() {
   if (state.playing || state.mode === "diff" || !state.frames.length) return;
@@ -508,10 +781,13 @@ function setIndex(index) {
   $("backBtn").hidden = true;
   $("legend").hidden = true;
   $("playBtn").disabled = false;
-  $("view").src = `/data/${state.datasetId}/${frame.png}`;
 
-  $("frameRange").value = state.index;
-  $("frameNumber").value = state.index;
+  const url = frameURL(frame);
+  const image = state.images.get(url);
+  if (image) state.viewer.show(image);
+  else state.viewer.showURL(url);
+
+  SliderControls.get("frame")?.setValue(state.index, { silent: true });
   $("caption").textContent = captionFor(frame, state.index, n);
   renderFrameInfo(frame);
   updateMarker(frame);
@@ -600,7 +876,7 @@ function showDiff(mode) {
 
   pause();
   state.mode = "diff";
-  $("view").src = `/api/diff/${state.datasetId}?a=${a}&b=${b}&mode=${mode}`;
+  state.viewer.showURL(diffURL(a, b, mode));
   $("legend").hidden = mode !== "sub";
   $("legend").textContent = mode === "sub"
     ? "A - B: blue = A fainter, red = A brighter (3 sigma)"
@@ -638,7 +914,7 @@ function renderSummary(manifest) {
     ? `${fmt(pm.pm_ra_mas_yr, 0)}, ${fmt(pm.pm_dec_mas_yr, 0)} mas/yr`
     : "not applied";
 
-  setKV($("summary"), [
+  const rows = [
     ["Target", state.params?.name || "field"],
     ["Centre", `${fmt(pm.ra_deg, 5)}, ${fmt(pm.dec_deg, 5)}`],
     ["Proper motion", pmText],
@@ -649,7 +925,11 @@ function renderSummary(manifest) {
     ["Wavelength", `${fmt(summary.wavelength_min, 3)} to ` +
                    `${fmt(summary.wavelength_max, 3)} um`],
     ["Alignment", request.track ? "track target motion" : "sky fixed"],
-  ]);
+  ];
+  if (manifest.complete === false) {
+    rows.push(["Build", "preview (continues in background)"]);
+  }
+  setKV($("summary"), rows);
 }
 
 function renderFrameInfo(frame) {
@@ -770,6 +1050,7 @@ function syncURL() {
   if (state.params.track) params.set("track", "1");
   params.set("fps", state.fps);
   params.set("frame", state.index);
+  params.set("interp", state.interp);
   if (state.playing) params.set("play", "1");
   if (document.body.classList.contains("embed")) params.set("embed", "1");
 
@@ -804,6 +1085,7 @@ function showProgress(text, fraction) {
 
 function hideProgress() {
   $("progress").hidden = true;
+  setCancelVisible(false);
 }
 
 function showError(message) {
@@ -811,6 +1093,7 @@ function showError(message) {
   box.hidden = false;
   box.classList.add("error");
   barStop();
+  setCancelVisible(false);
   $("progressText").textContent = message;
 }
 

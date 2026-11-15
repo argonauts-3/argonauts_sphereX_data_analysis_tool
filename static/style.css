@@ -30,6 +30,15 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em;
 
 #tagline { margin: 0 0 10px; color: var(--muted); font-size: 13px; }
 
+#titleRow {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+#guideBtn { flex: none; background: #202834; }
+
 #buildForm {
   display: flex;
   flex-wrap: wrap;
@@ -61,7 +70,32 @@ button:disabled { opacity: .45; cursor: default; }
 .pair input[type="range"] { width: 150px; }
 .pair input[type="number"] { width: 76px; }
 .unit { color: var(--muted); font-size: 12px; }
+.unit:empty { display: none; }
 .hint { margin: 2px 0 0; max-width: 340px; color: var(--muted); font-size: 11px; }
+
+/* Reusable slider component (static/controls.js). */
+.slider { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.slider-label { font-size: 11px; color: var(--muted); }
+.slider.disabled { opacity: .55; }
+.slider input:focus-visible,
+.number:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.transport-slider { display: inline-flex; min-width: 0; }
+.transport-slider .slider {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+}
+.transport-slider .slider .pair { gap: 6px; }
+.transport-slider .slider input[type="range"] { width: 170px; }
+.transport-slider .slider input[type="number"] { width: 68px; }
+.transport-slider .slider .hint { display: none; }
+
+#showBtn.dirty {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(108, 182, 255, .22);
+}
+#dirtyHint { margin: 6px 0 0; max-width: none; color: var(--accent); }
 
 .buttons { display: flex; gap: 6px; flex-wrap: wrap; }
 .check { display: inline-flex; align-items: center; gap: 4px; font-size: 13px; }
@@ -79,13 +113,14 @@ main {
 
 #stage {
   position: relative;
-  /* Size the box, not the image.  A percentage width on the image would be
+  /* Size the box, not the image.  A percentage width on the canvas would be
      resolved against this shrink-to-fit box, which is itself sized by the
      image, so the image would never grow.
 
      The 370 px reserve is for the form above and the transport/caption below,
      so Play stays on screen without scrolling. */
   width: min(100%, calc(100vh - 370px), 760px);
+  aspect-ratio: 1 / 1;
   background: #000;
   border: 1px solid var(--line);
   line-height: 0;
@@ -94,7 +129,18 @@ main {
 #view {
   display: block;
   width: 100%;
-  height: auto;
+  height: 100%;
+}
+
+#previewBanner {
+  margin: 8px auto 0;
+  padding: 7px 10px;
+  border: 1px solid var(--warn);
+  border-radius: 6px;
+  background: rgba(255, 179, 71, .08);
+  color: var(--warn);
+  font-size: 12px;
+  text-align: center;
 }
 
 #targetMarker {
@@ -130,6 +176,7 @@ main {
 
 #transport input[type="range"] { width: 180px; }
 #transport input[type="number"] { width: 70px; }
+#transport select { max-width: 140px; }
 .inline { font-size: 11px; color: var(--muted); }
 
 #caption {
@@ -150,6 +197,14 @@ main {
 #progress.error { border-color: var(--bad); }
 #progress.error #progressText { color: var(--bad); }
 #progressText { font-size: 12px; margin-bottom: 6px; }
+#progressRow {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+#progressRow #progressText { flex: 1; }
+#cancelBtn { flex: none; padding: 2px 8px; font-size: 11px; }
 
 #progressTrack { height: 4px; background: #0b0e12; border-radius: 3px; overflow: hidden; }
 #progressBar { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
@@ -201,7 +256,54 @@ body.embed main { grid-template-columns: 1fr; padding-top: 10px; }
   text-align: center;
 }
 
+/* Guide dialog */
+#guideDialog {
+  width: min(680px, calc(100vw - 32px));
+  max-height: min(82vh, 900px);
+  padding: 0;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+#guideDialog::backdrop { background: rgba(0, 0, 0, .65); }
+.guide-head {
+  position: sticky;
+  top: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+.guide-head h2 {
+  margin: 0;
+  color: var(--text);
+  font-size: 14px;
+  letter-spacing: .02em;
+  text-transform: none;
+}
+.guide-prose { padding: 4px 16px 18px; overflow: auto; max-height: calc(82vh - 52px); }
+.guide-prose h3 {
+  margin: 16px 0 4px;
+  font-size: 13px;
+  color: var(--accent);
+}
+.guide-prose p { margin: 0 0 8px; color: var(--text); font-size: 13px; }
+.guide-prose code {
+  padding: 1px 4px;
+  background: #0b0e12;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font-size: 12px;
+}
+.guide-more { margin-top: 18px; }
+.guide-more a { color: var(--accent); }
+
 @media (max-width: 980px) {
   main { grid-template-columns: 1fr; }
   #stage { width: min(100%, calc(100vh - 370px), 760px); }
+  .transport-slider .slider input[type="range"] { width: 120px; }
 }

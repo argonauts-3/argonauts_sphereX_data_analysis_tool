@@ -10,8 +10,11 @@
 
 <header id="top">
   <div id="titleRow">
-    <h1>SPHEREx time explorer</h1>
-    <p id="tagline">Blink through every SPHEREx exposure of a position, all six detectors.</p>
+    <div>
+      <h1>SPHEREx time explorer</h1>
+      <p id="tagline">Blink through every SPHEREx exposure of a position, all six detectors.</p>
+    </div>
+    <button id="guideBtn" type="button">Guide</button>
   </div>
 
   <form id="buildForm">
@@ -35,16 +38,7 @@
       <input id="decInput" type="number" step="0.000001" min="-90" max="90">
     </div>
 
-    <div class="field wide">
-      <label for="fovRange">Field of view</label>
-      <div class="pair">
-        <input id="fovRange" type="range" min="0.1" max="1" step="0.05" value="0.3">
-        <input id="fovNumber" type="number" min="0.1" max="1" step="0.05" value="0.3">
-        <span class="unit">deg</span>
-      </div>
-      <p class="hint">Bigger fields download more archive data: about 1.3 GB
-        at 0.3 deg and 4.5 GB at 1.0 deg. Cached after the first view.</p>
-    </div>
+    <div class="field wide" data-slider="fov"></div>
 
     <div class="field">
       <label for="t0Input">From</label>
@@ -76,21 +70,23 @@
     </div>
 
     <div class="field">
-      <label>&nbsp;</label>
-      <button id="showBtn" type="submit">Show</button>
+      <label for="showBtn">&nbsp;</label>
+      <button id="showBtn" type="submit" title="Apply the settings and load the images">Show</button>
     </div>
   </form>
+  <p id="dirtyHint" class="hint" hidden>Settings changed. Press Show (or Enter) to update the images.</p>
 </header>
 
 <main>
   <section id="viewer">
     <div id="stageWrap">
       <div id="stage">
-        <img id="view" alt="SPHEREx frame">
+        <canvas id="view" aria-label="SPHEREx frame">Your browser does not support canvas.</canvas>
         <div id="targetMarker" hidden></div>
       </div>
     </div>
 
+    <div id="previewBanner" hidden></div>
     <div id="legend" hidden></div>
 
     <div id="transport">
@@ -98,21 +94,30 @@
       <button id="prevBtn" type="button">-1</button>
       <button id="nextBtn" type="button">+1</button>
 
-      <label class="inline" for="frameRange">Frame</label>
-      <input id="frameRange" type="range" min="0" max="0" step="1" value="0">
-      <input id="frameNumber" type="number" min="0" max="0" step="1" value="0">
+      <span class="transport-slider" data-slider="frame"></span>
+      <span class="transport-slider" data-slider="fps"></span>
 
-      <label class="inline" for="fpsRange">fps</label>
-      <input id="fpsRange" type="range" min="0.5" max="12" step="0.5" value="4">
-      <input id="fpsNumber" type="number" min="0.5" max="12" step="0.5" value="4">
+      <label class="inline" for="interpSelect">Display</label>
+      <select id="interpSelect" title="Display interpolation only; measurements are unchanged">
+        <option value="nearest">Nearest (none)</option>
+        <option value="bilinear" selected>Bilinear</option>
+        <option value="bicubic">Bicubic</option>
+        <option value="lanczos">Lanczos</option>
+        <option value="gaussian">Gaussian</option>
+      </select>
 
       <button id="backBtn" type="button" hidden>Back to movie</button>
     </div>
+    <p id="viewerNotice" class="note" hidden>WebGL is unavailable, so only Nearest and smooth
+      (bilinear) display scaling are available.</p>
 
     <p id="caption">Loading...</p>
 
     <div id="progress" hidden>
-      <div id="progressText"></div>
+      <div id="progressRow">
+        <div id="progressText"></div>
+        <button id="cancelBtn" type="button" hidden>Cancel</button>
+      </div>
       <div id="progressTrack"><div id="progressBar"></div></div>
     </div>
   </section>
@@ -162,6 +167,65 @@
   Data: NASA/IPAC IRSA, SPHEREx DR1 and QR3. Prototype for NASA Space Apps 2026.
 </footer>
 
+<dialog id="guideDialog" aria-labelledby="guideTitle">
+  <div class="guide-head">
+    <h2 id="guideTitle">How to use the explorer</h2>
+    <button id="guideCloseBtn" type="button">Close</button>
+  </div>
+  <div class="guide-prose">
+    <h3>Pick a target</h3>
+    <p>Use the curated drop-down, type a name resolved by Sesame, or enter
+      J2000 RA/Dec in degrees. The name and coordinate fields are always
+      editable.</p>
+
+    <h3>Change settings, then press Show</h3>
+    <p>The target, field of view, dates, detectors and alignment do not rebuild
+      the images while you edit them. When anything changes, press
+      <strong>Show</strong> (or Enter in a field) to apply the new settings.
+      Playback controls act immediately.</p>
+
+    <h3>Field of view</h3>
+    <p>0.1–1.0 degrees, always rendered at 6.16&Prime;/pixel. Bigger fields
+      download more archive data; cached cutouts make repeat visits fast.</p>
+
+    <h3>Movie and A/B</h3>
+    <p>Space plays or pauses; arrow keys step. Frames are strictly
+      chronological by observation time, so same-epoch detectors sit next to
+      each other. A/B differences are allowed only within one detector.</p>
+
+    <h3>Display interpolation</h3>
+    <p>Nearest keeps hard pixel edges; bilinear is smooth; bicubic and Lanczos
+      are sharper and can ring around bright stars; Gaussian is soft. This is
+      display-only and never changes flux, S/N, flags or the A/B arithmetic.</p>
+
+    <h3>Preview and cancel</h3>
+    <p>A new target first shows a small preview from one detector while the
+      rest downloads. The banner says exactly what is shown. Cancel stops the
+      build; downloaded cutouts are kept and reused next time.</p>
+
+    <h3>Sharing</h3>
+    <p>The URL contains the target, field, dates, detectors, frame, fps,
+      display kernel and playback state. Add <code>embed=1</code> to hide the
+      form and side panels.</p>
+
+    <p class="guide-more"><a href="/guide" target="_blank" rel="noopener">Open the full guide (GUIDE.md)</a></p>
+  </div>
+</dialog>
+
+<template id="sliderTemplate">
+  <div class="slider">
+    <label class="slider-label" data-role="label"></label>
+    <div class="pair">
+      <input type="range" data-role="range">
+      <input type="number" data-role="number">
+      <span class="unit" data-role="unit"></span>
+    </div>
+    <p class="hint" data-role="hint" hidden></p>
+  </div>
+</template>
+
+<script src="/static/controls.js"></script>
+<script src="/static/viewer.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>
