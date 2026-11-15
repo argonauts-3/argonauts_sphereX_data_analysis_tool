@@ -5,9 +5,8 @@ finds the exposures in the IRSA archive, cuts a patch around the target from
 each one, aligns them all onto the same north-up grid, and lets you blink
 through them.  There is also an A-B / (A+B)/2 view for comparing two epochs.
 
-This is the functional prototype, not the final public tool: the visuals are
-plain on purpose and everything runs locally.  For a dated snapshot of what
-is built, what is cached and what remains, see `PROGRESS.md`.
+For the complete in-depth user and developer walkthrough, see [GUIDE.md](GUIDE.md).
+For a dated snapshot of what is built, what is cached and what remains, see `PROGRESS.md`.
 
 ## Run it
 
@@ -55,19 +54,28 @@ Everything is cached afterwards:
   they cannot silently override it.  A custom name with no coordinates is
   resolved by the server through Sesame; the five curated names use the
   coordinates already in the target list.
-- Field of view from 0.1 to 1.0 degrees.  Slider and number box are linked.
+- Field of view from 0.1 to 1.0 degrees using unified, declarative sliders
+  (`static/controls.js`) that snap and synchronize range and numeric inputs.
   The frames are always 6.16 arcsec/pixel, so a larger field shows more sky,
   not more detail.
 - Date range with "All / 2025 / 2026" shortcuts.
 - Detector checkboxes D1-D6.
 - Play / pause / step, frame slider plus number box, fps slider plus number
   box.  Space also plays, arrow keys step.
+- Display interpolation kernel selector (Nearest, Bilinear, Bicubic, Lanczos,
+  Gaussian) powered by WebGL fragment shaders in `static/viewer.js` (with 2D
+  Canvas fallback). Display-only: does not alter photometry or difference images.
 - A and B selectors, "A - B" and "(A + B) / 2".
+- Progressive preview: a 12-frame quick-look movie appears in seconds while
+  the remaining detectors continue downloading and processing in the background.
+- Cancel button: stop an active build immediately and automatically cancel
+  running builds when a new target is submitted.
 - Per-frame metadata: date, detector, wavelength, flux, peak S/N, target-pixel
   flags, offset from the grid centre.
 - "track the target" switches the alignment: off (default) keeps the sky
   fixed so everything moves as it really does; on keeps the moving target at
   the centre.
+- In-app Guide dialog (press 'g' or click "Guide") with comprehensive usage tips.
 
 The current view is always in the URL, so it can be shared or embedded:
 
@@ -86,8 +94,10 @@ The current view is always in the URL, so it can be shared or embedded:
 | `track` | `1` to track the target's proper motion |
 | `fps` | playback rate |
 | `frame` | frame index to show |
+| `interp` | display interpolation kernel (`nearest`, `bilinear`, `bicubic`, `lanczos`, `gaussian`) |
 | `play` | `1` to start playing |
 | `embed` | `1` to hide the form and side panels |
+| `guide` | `1` to automatically open the Guide modal on load |
 
 ## Files
 
@@ -170,13 +180,15 @@ in the same movie.  Two caches must be refreshed after changing the list:
 
 ## Precomputing a demo
 
-To warm the five curated targets at the default field before a presentation:
+To warm curated targets before a presentation:
 
 ```bash
-.venv/bin/python precompute.py
-# or just one:
-.venv/bin/python precompute.py --only "Barnard's Star" --fov 0.2
+# Warm all curated targets at default 0.3°:
+.venv/bin/python precompute.py --all-curated
+
+# Or specific targets and fields:
+.venv/bin/python precompute.py --only "Barnard's Star" --fov 0.2 --fov 0.3
 ```
 
-This downloads about 1.3 GB per target.  The app works without it; the first
-visit is just slower.
+This downloads cutouts into `cutout_cache/` (~1.3 GB per target at 0.3°). The app works without it; the first
+visit to an uncached target shows a 12-frame preview while building the full dataset.

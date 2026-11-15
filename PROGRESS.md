@@ -38,13 +38,16 @@ The project is deliberately a simple local prototype:
 
 | path | purpose |
 |---|---|
-| `test.py` | Original SPHEREx pipeline: SIA query, cutout download, measurement and alignment.  Extended with optional arguments; `python test.py` still behaves like the original script. |
-| `dataset.py` | Runs the pipeline for one web request, renders PNGs, writes `manifest.json`, and defines the dataset id and fetch tiers. |
-| `app.py` | Flask routes, request validation, curated targets, build queue/jobs and the difference-image endpoint. |
-| `static/index.html` | One page: target controls, viewer, transport, compare controls and frame table. |
-| `static/app.js` | All front-end behavior: form state, builds, polling, playback, URL state, compare view and image preloading. |
-| `static/style.css` | Layout and plain styling. |
-| `precompute.py` | Warms the cache for curated targets before a demo. |
+| `test.py` | Original SPHEREx pipeline: SIA query, cutout download, measurement and alignment.  Extended with optional arguments, footprint pre-check, gzip downloads, and cooperative cancellation. |
+| `dataset.py` | Runs the pipeline for one web request, progressive preview, renders PNGs, writes `manifest.json` (schema v2), and defines the dataset id and fetch tiers. |
+| `app.py` | Flask routes, request validation, curated targets, build queue/jobs with cooperative cancellation, diff endpoint, and progressive preview serving. |
+| `static/index.html` | One page: target controls, canvas viewer, transport, compare controls, frame table, and Guide modal. |
+| `static/controls.js` | Reusable slider + number input components (`SliderControls`), declarative mounting via `<template id="sliderTemplate">`. |
+| `static/viewer.js` | WebGL canvas frame viewer with user-selectable display interpolation kernels (nearest, bilinear, bicubic, lanczos, gaussian) and 2D fallback. |
+| `static/app.js` | Front-end behavior: form state, builds, polling, preview loading, playback, URL state, compare view, and image preloading. |
+| `static/style.css` | Layout, component styling, and Guide dialog prose. |
+| `GUIDE.md` | Comprehensive walkthrough for users and developers. |
+| `precompute.py` | Warms the cache for curated targets before a demo (`--all-curated`, repeatable `--fov`). |
 | `README_APP.md` | How to run and use the app, URL parameters and caveats. |
 | `requirements.txt` | Runtime dependencies. |
 | `PROGRESS.md` | This handoff/status document. |
@@ -227,15 +230,20 @@ The cutout files themselves are keyed by their archive URL and can stay
 cached.  A cleaner long-term fix is to include the release list in the dataset
 id instead of relying on a manual version bump; that is still open.
 
-## Manifest contents
+## Manifest contents (Schema v2)
 
 Top-level keys:
 
-- `version`, `id`, `created_utc`
+- `version` (bumped to 2), `id`, `created_utc`
+- `complete`: `true` for full build, `false` for progressive preview
+- `preview`: `true` during partial preview stage
+- `preview_band`: detector used for preview (e.g. `SPHEREx-D5`)
+- `planned`: planned total frame count and band count
+- `render_version`: version string used for cache-busting frame PNG URLs
 - `target`: RA, Dec and proper motion applied
 - `request`: FOV, dates, bands, track and cutout size
 - `grid`: `n`, pixel scale, CRVAL, CRPIX and CD matrix
-- `stretch`: rendering information
+- `stretch`: per-detector rendering stretch information
 - `summary`: frame count, detector count, date range and wavelength range
 - `frames`: one object per exposure
 
@@ -251,8 +259,16 @@ Each frame has:
 
 ## Performance work already done
 
-Initial loading was the main complaint.  Several changes are now in place:
+Loading time and responsiveness have been significantly optimized:
 
+- **Progressive Preview (Phase 4):** A 12-frame preview of the primary detector appears in seconds, letting the user inspect and blink frames immediately while the full build continues in the background.
+- **Cooperative Cancellation (Phase 3):** Running builds can be cancelled directly from the UI via the Cancel button, and submitting a new target automatically cancels previous in-flight requests.
+- **Bounded Submission & Timeouts:** Prefetch submits cutouts with bounded queues (`workers * 2`) and distinct connect/read timeouts `(10, 60)` s.
+- **Gzip & Thread-Local Sessions:** Cutouts are downloaded with `&gzip=1` saving ~14% bandwidth, using thread-local requests sessions with connection pooling.
+- **Footprint Pre-Check:** Exposures whose SIA `s_region` polygon does not contain the target are skipped before download, eliminating unnecessary 422 errors and wasted transfers.
+- **Larger-Cutout Reuse:** FOV reductions reuse already-downloaded larger cutout tiers without network transfers.
+- **Display Interpolation (Phase 1B):** GPU WebGL fragment shader scaling allows instant switching between nearest, bilinear, bicubic, lanczos, and gaussian kernels without touching the server or measurements.
+- **Reusable Sliders (Phase 1):** Declarative HTML template and unified controller (`controls.js`) synchronize range and numeric inputs without mismatch.
 - The page draws the first frame as soon as the manifest arrives, then
   preloads the remaining PNGs in the background.  Locally the first frame
   appears in about 0.6 seconds and all 258 images finish in under a second.
@@ -263,8 +279,6 @@ Initial loading was the main complaint.  Several changes are now in place:
   and skips aligned variance/flags, which the page never reads.  That removes
   two of the three reprojections per frame.
 - Downloads use 8 threads by default; `SPHEREX_DOWNLOAD_WORKERS` can raise it.
-- The manifest is written last, and the front end shows stage progress:
-  query, downloading, measuring, aligning and rendering.
 
 The remaining unavoidable cost is the archive download.  At 0.3 degrees a new
 target is roughly 1.3 GB and 10-20 minutes on a slow link.  At 1.0 degree it
