@@ -25,8 +25,10 @@ import test as pipeline
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--fov", type=float, default=0.3,
-                        help="field of view in degrees (default 0.3)")
+    parser.add_argument("--fov", type=float, action="append",
+                        help="field of view in degrees (may be repeated, default: 0.3)")
+    parser.add_argument("--all-curated", action="store_true",
+                        help="build every curated target at the given FOVs")
     parser.add_argument("--only", action="append", metavar="NAME",
                         help="curated target name, or a comma-separated list; "
                              "may be repeated (default: all)")
@@ -66,33 +68,46 @@ def print_progress(stage, done, total):
 
 def main():
     args = parse_args()
-    if not 0.1 <= args.fov <= 1.0:
-        raise SystemExit("--fov must be between 0.1 and 1.0 degrees")
-    fov = round(args.fov, 3)
+    fov_list = args.fov or [0.3]
+    for f in fov_list:
+        if not 0.1 <= f <= 1.0:
+            raise SystemExit(f"--fov must be between 0.1 and 1.0 degrees, got {f}")
+    fovs = [round(f, 3) for f in fov_list]
 
-    targets = wanted_targets(args.only)
-    print(f"{len(targets)} target(s), field {fov} deg, all detectors")
+    targets = list(app.TARGETS) if args.all_curated else wanted_targets(args.only)
+    print(f"{len(targets)} target(s), fields {fovs} deg, all detectors")
 
-    for number, target in enumerate(targets, start=1):
-        key = dataset.dataset_id(target["ra"], target["dec"], fov, None, None,
-                                 pipeline.BANDS, False)
-        print(f"\n[{number}/{len(targets)}] {target['name']}  id {key}")
-        out_dir = dataset.DATA_ROOT / key
-        if (out_dir / "manifest.json").exists():
-            print("  already built, skipping")
-            continue
+    total_tasks = len(targets) * len(fovs)
+    current = 0
+    for target in targets:
+        for fov in fovs:
+            current += 1
+            key = dataset.dataset_id(target["ra"], target["dec"], fov, None, None,
+                                     pipeline.BANDS, False)
+            print(f"\n[{current}/{total_tasks}] {target['name']}  fov {fov} deg  id {key}")
+            out_dir = dataset.DATA_ROOT / key
+            manifest_path = out_dir / "manifest.json"
+            if manifest_path.exists():
+                try:
+                    import json
+                    m = json.loads(manifest_path.read_text())
+                    if m.get("complete", True):
+                        print("  already built, skipping")
+                        continue
+                except Exception:
+                    pass
 
-        proper_motion = (target["pm"][0] * u.mas / u.yr,
-                         target["pm"][1] * u.mas / u.yr)
-        try:
-            dataset.build_dataset(
-                target["ra"], target["dec"], key, fov, None, None,
-                list(pipeline.BANDS), track=False,
-                proper_motion=proper_motion, progress=print_progress)
-        except Exception as exc:                # noqa: BLE001 - keep going
-            print(f"  failed: {exc}")
-            continue
-        print(f"  done: {out_dir}")
+            proper_motion = (target["pm"][0] * u.mas / u.yr,
+                             target["pm"][1] * u.mas / u.yr)
+            try:
+                dataset.build_dataset(
+                    target["ra"], target["dec"], key, fov, None, None,
+                    list(pipeline.BANDS), track=False,
+                    proper_motion=proper_motion, progress=print_progress)
+            except Exception as exc:                # noqa: BLE001 - keep going
+                print(f"  failed: {exc}")
+                continue
+            print(f"  done: {out_dir}")
 
     print("\nall requested targets are ready")
 

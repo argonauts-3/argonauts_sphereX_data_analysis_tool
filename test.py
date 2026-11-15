@@ -46,10 +46,13 @@ import hashlib
 import io
 import os
 import sys
+import threading
 import time
 import warnings
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait,
+)
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple, Optional
@@ -115,6 +118,92 @@ MAX_FRAMES_PER_BAND = None
 # A local demo can try `SPHEREX_DOWNLOAD_WORKERS=16`; the build retries 502/503
 # downloads, so pushing too hard costs more in retries than it saves.
 DOWNLOAD_WORKERS = int(os.environ.get("SPHEREX_DOWNLOAD_WORKERS", "8"))
+
+# Cutout downloads.  IRSA supports `&gzip=1` on the cutout endpoint, which
+# cuts the transfer by roughly 14% without changing the FITS content.  The
+# cache key stays the un-gzipped URL so existing downloads keep working.
+CUTOUT_GZIP = os.environ.get("SPHEREX_GZIP", "1") != "0"
+USER_AGENT = "SPHEREx-Time-Explorer/2.0 (local NASA Space Apps prototype)"
+DOWNLOAD_TIMEOUT = (10, 60)       # connect, read
+
+_THREAD_LOCAL = threading.local()
+
+
+def _session() -> requests.Session:
+    """A requests.Session per worker thread, with a matching connection pool."""
+    session = getattr(_THREAD_LOCAL, "session", None)
+    if session is None:
+        from requests.adapters import HTTPAdapter
+
+        pool = max(4, DOWNLOAD_WORKERS * 2)
+        adapter = HTTPAdapter(pool_connections=pool, pool_maxsize=pool,
+                              max_retries=0)
+        session = requests.Session()
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        session.headers.update({"User-Agent": USER_AGENT})
+        _THREAD_LOCAL.session = session
+    return session
+
+
+class BuildCancelled(Exception):
+    """Raised cooperatively when a newer build replaces this one."""
+
+
+def parse_s_region_polygon(s_region: str) -> Optional[np.ndarray]:
+    """Parse 'POLYGON ICRS ra1 dec1 ra2 dec2 ...' into an (N, 2) array of (ra, dec)."""
+    if not s_region or not isinstance(s_region, str):
+        return None
+    parts = s_region.strip().split()
+    coords = []
+    for p in parts:
+        try:
+            coords.append(float(p))
+        except ValueError:
+            pass
+    if len(coords) < 6 or len(coords) % 2 != 0:
+        return None
+    return np.array(coords, dtype=float).reshape(-1, 2)
+
+
+def footprint_contains_target(s_region: str, target_pos: SkyCoord) -> bool:
+    """True if target_pos falls inside the exposure's s_region polygon.
+
+    Projected into a local tangent plane to avoid RA wrap near 0/360.
+    Fails open (returns True) if s_region is missing or unparseable.
+    """
+    poly = parse_s_region_polygon(s_region)
+    if poly is None:
+        return True
+    from matplotlib.path import Path as MplPath
+
+    ra0 = target_pos.ra.deg
+    dec0 = target_pos.dec.deg
+    dec0_rad = np.radians(dec0)
+    dra = (poly[:, 0] - ra0 + 180.0) % 360.0 - 180.0
+    x = dra * np.cos(dec0_rad)
+    y = poly[:, 1] - dec0
+    path = MplPath(np.column_stack([x, y]))
+    return bool(path.contains_point((0.0, 0.0)))
+
+
+def filter_footprint(exposures: Table, target: SkyCoord,
+                     proper_motion=None) -> Table:
+    """Drop exposures whose detector footprint does not contain the target."""
+    if len(exposures) == 0 or "s_region" not in exposures.colnames:
+        return exposures
+
+    keep = np.ones(len(exposures), dtype=bool)
+    for i, row in enumerate(exposures):
+        obs_time = Time(float(row["t_min"]), format="mjd")
+        pos = target_position_at(target, obs_time, proper_motion)
+        keep[i] = footprint_contains_target(str(row["s_region"]), pos)
+
+    skipped = int((~keep).sum())
+    if skipped > 0:
+        print(f"footprint pre-check: skipped {skipped} edge exposures off target "
+              f"({keep.sum()}/{len(exposures)} kept)")
+    return exposures[keep]
 
 # The six SPHEREx detectors.
 BANDS = ("SPHEREx-D1", "SPHEREx-D2", "SPHEREx-D3",
@@ -271,7 +360,7 @@ def _query_one_collection(collection, ra_deg, dec_deg, radius_deg,
     for attempt in range(1, attempts + 1):
         started = time.time()
         try:
-            response = requests.get(SIA_URL, params=params, timeout=timeout)
+            response = _session().get(SIA_URL, params=params, timeout=timeout)
         except (requests.Timeout, requests.ConnectionError) as exc:
             print(f"  [{attempt}/{attempts}] {type(exc).__name__} "
                   f"after {time.time() - started:.0f}s")
@@ -346,8 +435,17 @@ class NotCovered(Exception):
 
 
 def cutout_url(access_url, ra_deg, dec_deg, size_deg):
-    """The exact URL of one cutout.  It is also the cache key."""
+    """The canonical URL of one cutout, also used as the cache key.
+
+    The `gzip=1` request parameter is deliberately *not* part of this URL:
+    the cache must keep working for files downloaded before gzip was enabled.
+    """
     return f"{access_url}?center={ra_deg:.7f},{dec_deg:.7f}&size={size_deg}"
+
+
+def cutout_request_url(url):
+    """The URL actually fetched, with transparent gzip compression enabled."""
+    return url + ("&gzip=1" if CUTOUT_GZIP else "")
 
 
 def cutout_cache_path(url, cache_dir=None):
@@ -357,19 +455,34 @@ def cutout_cache_path(url, cache_dir=None):
 
 
 def fetch_cutout(access_url, ra_deg, dec_deg, size_deg,
-                 cache_dir=None, attempts=3) -> fits.HDUList:
+                 cache_dir=None, attempts=3, reuse_sizes=(),
+                 should_cancel=None) -> fits.HDUList:
     """Download a square cutout (a FITS file) centred on a sky position.
 
     Downloaded files are saved in `cache_dir`, so re-running is fast.
+
+    `reuse_sizes` lets a small request reuse a larger cached cutout of the
+    same centre.  The caller still reprojects onto its own output grid, so
+    the extra border does not change alignment or measurements.
+
+    `should_cancel()` is polled between attempts so a large parallel download
+    can stop promptly when the user starts a different target.
     """
     url = cutout_url(access_url, ra_deg, dec_deg, size_deg)
-    cache_file = cutout_cache_path(url, cache_dir) if cache_dir is not None else None
-    if cache_file is not None and cache_file.exists():
-        return fits.open(cache_file)
+    sizes = (size_deg,) + tuple(s for s in reuse_sizes if s > size_deg)
+    if cache_dir is not None:
+        for size in sizes:
+            cache_file = cutout_cache_path(
+                cutout_url(access_url, ra_deg, dec_deg, size), cache_dir)
+            if cache_file.exists():
+                return fits.open(cache_file)
 
+    request_url = cutout_request_url(url)
     for attempt in range(1, attempts + 1):
+        if should_cancel is not None and should_cancel():
+            raise BuildCancelled("build cancelled")
         try:
-            response = requests.get(url, timeout=120)
+            response = _session().get(request_url, timeout=DOWNLOAD_TIMEOUT)
         except requests.RequestException:
             if attempt == attempts:
                 raise
@@ -379,7 +492,8 @@ def fetch_cutout(access_url, ra_deg, dec_deg, size_deg,
         if response.status_code == 200:
             if not response.content.startswith(b"SIMPLE"):   # every FITS file starts so
                 raise OSError(f"not a FITS file from {access_url}")
-            if cache_file is not None:
+            if cache_dir is not None:
+                cache_file = cutout_cache_path(url, cache_dir)
                 cache_file.parent.mkdir(parents=True, exist_ok=True)
                 # Write to a temporary name, then rename: a half-written file
                 # would break every later run that reads the cache.
@@ -401,7 +515,8 @@ def fetch_cutout(access_url, ra_deg, dec_deg, size_deg,
 
 
 def prefetch_cutouts(rows, ra_deg, dec_deg, size_deg, workers=None,
-                     cutout_dir=None, progress=None) -> set:
+                     cutout_dir=None, progress=None, reuse_sizes=(),
+                     should_cancel=None) -> set:
     """Download every cutout that is not cached yet, several at a time.
 
     Each URL maps to its own cache file, so the threads never collide.  Only
@@ -411,42 +526,87 @@ def prefetch_cutouts(rows, ra_deg, dec_deg, size_deg, workers=None,
     `progress(done, total)` is called as each download finishes, for the web
     app's progress bar.
 
+    `should_cancel()` is checked between small batches.  At most about twice
+    the worker count is in flight, so cancellation does not leave hundreds of
+    queued downloads to run after the user has moved on.
+
     Returns the obs_ids that could not be downloaded, so the caller can skip
     them once instead of retrying each of them slowly and serially.
     """
     workers = DOWNLOAD_WORKERS if workers is None else workers
-    missing = []
-    for row in rows:
-        url = cutout_url(row["access_url"], ra_deg, dec_deg, size_deg)
-        if not cutout_cache_path(url, cutout_dir).exists():
-            missing.append(row)
+    sizes = (size_deg,) + tuple(s for s in reuse_sizes if s > size_deg)
+
+    def is_cached(row):
+        return any(
+            cutout_cache_path(cutout_url(row["access_url"], ra_deg, dec_deg,
+                                         size), cutout_dir).exists()
+            for size in sizes
+        )
+
+    missing = [row for row in rows if not is_cached(row)]
     if not missing:
         if progress is not None:
             progress(0, 0)
         return set()
+    if should_cancel is not None and should_cancel():
+        raise BuildCancelled("build cancelled")
 
     print(f"downloading {len(missing)} cutouts, {workers} at a time")
     failed = set()
+
+    def row_key(row):
+        # obs_id is shared by the six detectors from one observation, so the
+        # band must be part of the key: one detector can be off the target
+        # while another covers it.
+        return (row["energy_bandpassname"], row["obs_id"])
     done = 0
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        jobs = {
-            pool.submit(fetch_cutout, row["access_url"], ra_deg, dec_deg,
-                        size_deg, cutout_dir): row["obs_id"]
-            for row in missing
-        }
-        for job in as_completed(jobs):
-            obs_id = jobs[job]
-            try:
-                job.result().close()          # opened only to fill the cache
-            except NotCovered:
-                print("  skip (off footprint):", obs_id)
-                failed.add(obs_id)
-            except (requests.HTTPError, OSError) as exc:
-                print("  skip (HTTP):", obs_id, exc)
-                failed.add(obs_id)
-            done += 1
-            if progress is not None:
-                progress(done, len(missing))
+    pool = ThreadPoolExecutor(max_workers=workers)
+    pending = {}
+    remaining = iter(missing)
+    limit = max(1, workers * 2)
+
+    def submit_one():
+        try:
+            row = next(remaining)
+        except StopIteration:
+            return False
+        future = pool.submit(fetch_cutout, row["access_url"], ra_deg, dec_deg,
+                             size_deg, cutout_dir, 3, reuse_sizes,
+                             should_cancel)
+        pending[future] = row
+        return True
+
+    try:
+        while len(pending) < limit and submit_one():
+            pass
+
+        while pending:
+            if should_cancel is not None and should_cancel():
+                raise BuildCancelled("build cancelled")
+
+            finished, _ = wait(list(pending), return_when=FIRST_COMPLETED)
+            for future in finished:
+                row = pending.pop(future)
+                try:
+                    future.result().close()       # opened only to fill the cache
+                except BuildCancelled:
+                    raise
+                except NotCovered:
+                    print("  skip (off footprint):", row["obs_id"])
+                    failed.add(row_key(row))
+                except (requests.HTTPError, OSError) as exc:
+                    print("  skip (HTTP):", row["obs_id"], exc)
+                    failed.add(row_key(row))
+                done += 1
+                if progress is not None:
+                    progress(done, len(missing))
+
+            while len(pending) < limit and submit_one():
+                pass
+    finally:
+        for future in pending:
+            future.cancel()
+        pool.shutdown(wait=True, cancel_futures=True)
     return failed
 
 
@@ -661,7 +821,8 @@ class Frame:
 
 
 def load_frame(row, band, target, reference, cutout_size_deg,
-               proper_motion=None, cutout_dir=None) -> Optional[Frame]:
+               proper_motion=None, cutout_dir=None, reuse_sizes=(),
+               should_cancel=None) -> Optional[Frame]:
     """Download one cutout and measure the target in it.
 
     `row` is one line of the archive's exposure table.  `reference` is the
@@ -670,7 +831,11 @@ def load_frame(row, band, target, reference, cutout_size_deg,
     """
     try:
         hdul = fetch_cutout(row["access_url"], reference.ra.deg, reference.dec.deg,
-                            cutout_size_deg, cache_dir=cutout_dir)
+                            cutout_size_deg, cache_dir=cutout_dir,
+                            reuse_sizes=reuse_sizes,
+                            should_cancel=should_cancel)
+    except BuildCancelled:
+        raise
     except NotCovered:
         print("  skip (off footprint):", row["obs_id"])
         return None
@@ -749,7 +914,8 @@ def load_frame(row, band, target, reference, cutout_size_deg,
 
 def download_frames(exposures, bands_present, target, reference, cutout_size_deg,
                     max_frames=None, workers=None, cutout_dir=None,
-                    proper_motion=None, progress=None, measure_progress=None):
+                    proper_motion=None, progress=None, measure_progress=None,
+                    reuse_sizes=(), should_cancel=None):
     """Load frames for every band, oldest exposures first.
 
     `max_frames` caps the exposures per band (None = all).  `progress` is
@@ -768,18 +934,25 @@ def download_frames(exposures, bands_present, target, reference, cutout_size_deg
     failed = prefetch_cutouts([row for _, rows in plan for row in rows],
                               reference.ra.deg, reference.dec.deg,
                               cutout_size_deg, workers=workers,
-                              cutout_dir=cutout_dir, progress=progress)
+                              cutout_dir=cutout_dir, progress=progress,
+                              reuse_sizes=reuse_sizes,
+                              should_cancel=should_cancel)
 
     frames = []
     total_rows = sum(len(rows) for _, rows in plan)
     for band, rows in plan:
         print(f"\n{band}: {len(rows)} frames")
         for row in rows:
-            if row["obs_id"] in failed:
+            if should_cancel is not None and should_cancel():
+                raise BuildCancelled("build cancelled")
+            key = (row["energy_bandpassname"], row["obs_id"])
+            if key in failed or row["obs_id"] in failed:
                 continue
             frame = load_frame(row, band, target, reference, cutout_size_deg,
                                proper_motion=proper_motion,
-                               cutout_dir=cutout_dir)
+                               cutout_dir=cutout_dir,
+                               reuse_sizes=reuse_sizes,
+                               should_cancel=should_cancel)
             if frame is not None:
                 frames.append(frame)
             if measure_progress is not None:
@@ -825,7 +998,8 @@ def shifted_wcs(wcs, shift_ra_deg, shift_dec_deg):
 
 
 def align_frames(frames, ra, dec, fov_deg=None, track=True,
-                 release_source=False, aux_planes=True):
+                 release_source=False, aux_planes=True,
+                 should_cancel=None):
     """Resample every frame onto one common grid (stored in frame.*_aligned).
 
     `track=True` shifts each frame so the moving target stays at the centre.
@@ -845,6 +1019,8 @@ def align_frames(frames, ra, dec, fov_deg=None, track=True,
     print(f"\noutput grid: {n}x{n} px, 6.1577\"/px, north up")
 
     for frame in frames:
+        if should_cancel is not None and should_cancel():
+            raise BuildCancelled("build cancelled")
         # Register on the moving target, not the background stars, so the
         # target lands on the same pixel in every epoch.
         wcs = shifted_wcs(frame.wcs, frame.shift_ra_deg,
