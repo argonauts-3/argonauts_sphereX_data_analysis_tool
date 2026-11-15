@@ -72,6 +72,17 @@ Everything is cached afterwards:
   running builds when a new target is submitted.
 - Per-frame metadata: date, detector, wavelength, flux, peak S/N, target-pixel
   flags, offset from the grid centre.
+- Colourbar under the image (MJy/sr above each frame's median sky, for the detector
+  on screen) and black / white level sliders.  The levels re-window the 8-bit PNG
+  in the shader; they cannot recover pixels clipped at the 1st / 99.5th percentile.
+  Difference images are never re-windowed.
+- Frame filters in the Frames panel: a tick box per frame, a wavelength window
+  (min / max um) and quick buttons (Drop flagged, Drop S/N < 3, Drop blended).
+  Hidden frames are skipped by Play, the frame slider, the A/B lists and the plots,
+  and drawn hollow in the plots.  The filter is client-side only; no rebuild.
+- Measurements panel: spectrum (aperture flux vs wavelength) and light curve
+  (flux vs date), both with error bars, clickable points and a CSV download.
+  The light curve warns when the plotted frames span a wide wavelength range.
 - "track the target" switches the alignment: off (default) keeps the sky
   fixed so everything moves as it really does; on keeps the moving target at
   the centre.
@@ -95,6 +106,9 @@ The current view is always in the URL, so it can be shared or embedded:
 | `fps` | playback rate |
 | `frame` | frame index to show |
 | `interp` | display interpolation kernel (`nearest`, `bilinear`, `bicubic`, `lanczos`, `gaussian`) |
+| `wl0`, `wl1` | wavelength window in um (both needed) |
+| `skip` | unticked frame indices, e.g. `3-5,9`; they refer to the complete dataset |
+| `lo`, `hi` | black / white level in percent of the stretch |
 | `play` | `1` to start playing |
 | `embed` | `1` to hide the form and side panels |
 | `guide` | `1` to automatically open the Guide modal on load |
@@ -108,7 +122,8 @@ The current view is always in the URL, so it can be shared or embedded:
   `manifest.json`.
 - `app.py` - Flask routes, request validation, one build at a time, the
   difference endpoint.
-- `static/` - one HTML page, one JS file, one CSS file.  No build step.
+- `static/` - one HTML page, four JS files (`app.js`, `viewer.js`, `controls.js`,
+  `plots.js`) and one CSS file.  No build step.
 
 ## How the images are made
 
@@ -145,9 +160,10 @@ in the same movie.  Two caches must be refreshed after changing the list:
 
 ## Not in this prototype
 
-- No pixel-level spectrum or wavelength slider.  Wavelength is shown per
-  frame in the table and metadata, but each view is one detector at a time.
-- No measured light curve or period search; the flux column is per exposure.
+- No per-pixel spectrum.  The Measurements panel plots the target's aperture
+  flux per frame, not a spectrum for every pixel.
+- No period search and no stacked image (the notebook's inverse-variance stack
+  needs float data the PNGs do not hold).
 - No pan/zoom beyond the browser's own image scaling.  The field is fixed by
   the FOV control.
 - No user accounts or server-side persistence.  The URL is the whole state.

@@ -38,6 +38,7 @@ function createFrameViewer(canvas, options = {}) {
   let currentImage = null;
   let requestToken = 0;
   let destroyed = false;
+  let levels = [0, 1];               // black / white point, texture units 0..1
 
   const imageCache = new Map();
 
@@ -56,6 +57,8 @@ function createFrameViewer(canvas, options = {}) {
     uniform sampler2D uTex;
     uniform int uKernel;
     uniform vec2 uTexSize;
+    uniform float uBlack;
+    uniform float uWhite;
     varying vec2 vUV;
 
     float cubicWeight(float x) {
@@ -143,7 +146,9 @@ function createFrameViewer(canvas, options = {}) {
         color = sum / total;
       }
 
-      gl_FragColor = vec4(color.rgb, 1.0);
+      // Black / white point.  (0, 1) leaves the image unchanged.
+      vec3 leveled = clamp((color.rgb - vec3(uBlack)) / max(uWhite - uBlack, 1.0e-4), 0.0, 1.0);
+      gl_FragColor = vec4(leveled, 1.0);
     }
   `;
 
@@ -206,6 +211,8 @@ function createFrameViewer(canvas, options = {}) {
       texture: gl.getUniformLocation(program, "uTex"),
       kernel: gl.getUniformLocation(program, "uKernel"),
       size: gl.getUniformLocation(program, "uTexSize"),
+      black: gl.getUniformLocation(program, "uBlack"),
+      white: gl.getUniformLocation(program, "uWhite"),
     };
 
     texture = gl.createTexture();
@@ -283,6 +290,8 @@ function createFrameViewer(canvas, options = {}) {
       gl.uniform1i(uniforms.texture, 0);
       gl.uniform1i(uniforms.kernel, FRAME_KERNELS.indexOf(kernel));
       gl.uniform2f(uniforms.size, textureSize[0], textureSize[1]);
+      gl.uniform1f(uniforms.black, levels[0]);
+      gl.uniform1f(uniforms.white, levels[1]);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
       return;
     }
@@ -294,6 +303,7 @@ function createFrameViewer(canvas, options = {}) {
     ctx2d.imageSmoothingEnabled = kernel !== "nearest";
     ctx2d.imageSmoothingQuality = "high";
     ctx2d.drawImage(currentImage, 0, 0, width, height);
+    if (levels[0] > 0 || levels[1] < 1) applyLevels2d(width, height);
   }
 
   function supports(name) {
@@ -305,6 +315,42 @@ function createFrameViewer(canvas, options = {}) {
   function setKernel(name) {
     if (!supports(name)) return false;
     kernel = name;
+    draw();
+    return true;
+  }
+
+  /** 2D fallback: apply the black / white point to the drawn pixels. */
+  function applyLevels2d(width, height) {
+    let data;
+    try {
+      data = ctx2d.getImageData(0, 0, width, height);
+    } catch (_) {
+      return;
+    }
+    const span = Math.max(levels[1] - levels[0], 1e-4);
+    const lut = new Uint8ClampedArray(256);
+    for (let v = 0; v < 256; v++) {
+      lut[v] = Math.round(255 * Math.min(Math.max((v / 255 - levels[0]) / span, 0), 1));
+    }
+    const px = data.data;
+    for (let i = 0; i < px.length; i += 4) {
+      px[i] = lut[px[i]];
+      px[i + 1] = lut[px[i + 1]];
+      px[i + 2] = lut[px[i + 2]];
+    }
+    ctx2d.putImageData(data, 0, 0);
+  }
+
+  /**
+   * Black and white point as texture values (0 = black, 1 = white).  The app
+   * passes (0, 1) for difference images so they keep their own stretch.
+   */
+  function setLevels(black, white) {
+    const b = Math.min(Math.max(Number(black), 0), 1);
+    const w = Math.min(Math.max(Number(white), 0), 1);
+    if (!Number.isFinite(b) || !Number.isFinite(w) || w <= b) return false;
+    if (b === levels[0] && w === levels[1]) return true;
+    levels = [b, w];
     draw();
     return true;
   }
@@ -379,11 +425,13 @@ function createFrameViewer(canvas, options = {}) {
   return {
     get mode() { return mode; },
     get kernel() { return kernel; },
+    get levels() { return [...levels]; },
     get supportedKernels() {
       return mode === "webgl" ? [...FRAME_KERNELS] : ["nearest", "bilinear"];
     },
     supports,
     setKernel,
+    setLevels,
     show,
     showURL,
     preload,

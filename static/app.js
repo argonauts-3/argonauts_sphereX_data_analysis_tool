@@ -21,6 +21,10 @@ const BANDS = ["SPHEREx-D1", "SPHEREx-D2", "SPHEREx-D3",
                "SPHEREx-D4", "SPHEREx-D5", "SPHEREx-D6"];
 const BAND_SHORT = Object.fromEntries(BANDS.map(b => [b, b.slice(-2)]));
 const INTERP_MODES = ["nearest", "bilinear", "bicubic", "lanczos", "gaussian"];
+const LEVEL_GAP = 2;      // minimum distance between black and white level, percent
+const FAINT_SNR = 3;      // "Drop faint" removes frames with peak S/N below this
+const BLEND_PX = 0.5;     // centroid further than this from the target = blended
+
 const STAGE_LABEL = {
   queued: "Queued",
   query: "Searching the archive",
@@ -56,6 +60,18 @@ const state = {
   interp: "bilinear",
   viewer: null,
   dirty: false,
+  // Frame filters (client-side only; nothing here triggers a rebuild).
+  excluded: new Set(),            // frameKey() of every frame the user unticked
+  filter: { wl: null },           // null, or [min, max] wavelength window in um
+  wlBounds: null,                 // [min, max] of the loaded frames, rounded outwards
+  visible: [],                    // visible[i] is true when frames[i] passes the filters
+  order: [],                      // manifest indices of the visible frames, ascending
+  levels: { black: 0, white: 1 }, // display window inside the PNG's stretch, 0..1
+  plots: null,
+  wantSkip: null,                 // unticked indices from the URL, applied to the full manifest
+  compareRefresh: 0,
+  urlTimer: null,
+  colorbarKey: "",
 };
 
 // --------------------------------------------------------------------------
@@ -90,6 +106,12 @@ async function init() {
 
   buildBandCheckboxes();
   wireControls();
+  state.plots = createFramePlots($("plots"), {
+    onPick: index => { pause(); setIndex(index); },
+    getFilename: () =>
+      `spherex_${(state.params?.name || "frames").replace(/[^A-Za-z0-9_-]+/g, "_")}.csv`,
+  });
+  readViewStateFromQuery(query);
 
   if (query.get("guide") === "1") openGuide();
 
@@ -159,7 +181,33 @@ function registerSliders() {
     onCommit: pauseAndSetIndex,
   });
 
+  // Display window inside the PNG's stretch, in percent of that stretch.
+  SliderControls.register("black", {
+    label: "Black level", min: 0, max: 100 - LEVEL_GAP, step: 1, value: 0,
+    unit: "%", precision: 0,
+    onInput: changeLevels, onCommit: changeLevels,
+  });
+  SliderControls.register("white", {
+    label: "White level", min: LEVEL_GAP, max: 100, step: 1, value: 100,
+    unit: "%", precision: 0,
+    onInput: changeLevels, onCommit: changeLevels,
+  });
+
+  // Wavelength window.  Bounds are replaced when a dataset loads.
+  SliderControls.register("wlmin", {
+    label: "Min wavelength", min: 0.7, max: 5.2, step: 0.01, value: 0.7,
+    unit: "um", precision: 2,
+    onInput: changeWavelength, onCommit: changeWavelength,
+  });
+  SliderControls.register("wlmax", {
+    label: "Max wavelength", min: 0.7, max: 5.2, step: 0.01, value: 5.2,
+    unit: "um", precision: 2,
+    onInput: changeWavelength, onCommit: changeWavelength,
+  });
+
   SliderControls.mountAll();
+  SliderControls.get("wlmin")?.setDisabled(true);
+  SliderControls.get("wlmax")?.setDisabled(true);
 }
 
 function wireControls() {
@@ -217,8 +265,8 @@ function wireControls() {
     if (state.mode === "diff") return;
     state.playing ? pause() : play();
   });
-  $("prevBtn").addEventListener("click", () => { pause(); setIndex(state.index - 1); });
-  $("nextBtn").addEventListener("click", () => { pause(); setIndex(state.index + 1); });
+  $("prevBtn").addEventListener("click", () => { pause(); stepVisible(-1); });
+  $("nextBtn").addEventListener("click", () => { pause(); stepVisible(1); });
 
   // The listener would otherwise pass the click event as `silent`.
   $("backBtn").addEventListener("click", () => backToMovie());
@@ -241,7 +289,22 @@ function wireControls() {
 
   $("trackInput").addEventListener("change", markDirty);
 
+  // The listeners are wrapped so the click event is not passed as an option.
+  $("levelsResetBtn").addEventListener("click", () => resetLevels());
+  $("resetFilterBtn").addEventListener("click", () => resetFilters());
+  $("selNoneBtn").addEventListener("click", () => excludeWhere(() => true));
+  $("dropFlaggedBtn").addEventListener("click", () => excludeWhere(frame => frame.target_bad));
+  $("dropFaintBtn").addEventListener("click", () =>
+    excludeWhere(frame => Number.isFinite(frame.peak_snr) && frame.peak_snr < FAINT_SNR));
+  $("dropBlendedBtn").addEventListener("click", () => excludeWhere(isBlended));
+
   $("frameRows").addEventListener("click", event => {
+    const box = event.target.closest("input[data-pick]");
+    if (box) {
+      // The checkbox has already flipped; follow it without jumping to the row.
+      setExcluded(parseInt(box.dataset.pick, 10), !box.checked);
+      return;
+    }
     const row = event.target.closest("tr[data-i]");
     if (!row) return;
     pause();
@@ -270,8 +333,8 @@ function wireControls() {
     const tag = (event.target.tagName || "").toLowerCase();
     if (["input", "select", "textarea", "button"].includes(tag)) return;
     if (event.key === " ") { event.preventDefault(); state.playing ? pause() : play(); }
-    if (event.key === "ArrowRight") { pause(); setIndex(state.index + 1); }
-    if (event.key === "ArrowLeft") { pause(); setIndex(state.index - 1); }
+    if (event.key === "ArrowRight") { pause(); stepVisible(1); }
+    if (event.key === "ArrowLeft") { pause(); stepVisible(-1); }
     if (event.key === "g" || event.key === "G") openGuide();
   });
 }
@@ -463,6 +526,8 @@ async function startBuild(request) {
   // Keep the current frame across a rebuild (FOV or date change); a brand-new
   // target just starts at frame 0 because there is no old frame list yet.
   if (state.frames.length) state.wantFrame = state.index;
+  // A different field has different exposures: forget the old unticked frames.
+  if (state.params && !sameField(state.params, params)) resetFilters({ quiet: true });
   state.params = params;
   state.jobId = null;
   syncURL();
@@ -642,13 +707,14 @@ function applyManifest(manifest, options = {}) {
   state.frames = manifest.frames || [];
   state.mode = "movie";
 
+  adoptPendingSkip(manifest);
   renderSummary(manifest);
   renderTable(state.frames);
-  fillCompare(state.frames);
+  setupWavelengthSliders(state.frames);
+  recomputeVisible({ resetCompare: true });
   updatePreviewBanner(manifest);
 
   const last = Math.max(0, state.frames.length - 1);
-  SliderControls.get("frame")?.setBounds(0, last);
 
   let wanted = options.frame;
   if (!Number.isInteger(wanted)) {
@@ -754,11 +820,11 @@ function changePlaybackRate(value) {
 }
 
 function play() {
-  if (state.playing || state.mode === "diff" || !state.frames.length) return;
+  if (state.playing || state.mode === "diff" || !state.order.length) return;
   state.playing = true;
   $("playBtn").textContent = "Pause";
   const interval = Math.max(80, 1000 / state.fps);
-  state.timer = setInterval(() => setIndex(state.index + 1), interval);
+  state.timer = setInterval(() => stepVisible(1), interval);
   syncURL();
 }
 
@@ -782,23 +848,27 @@ function setIndex(index) {
   $("legend").hidden = true;
   $("playBtn").disabled = false;
 
+  pushLevels();
+
   const url = frameURL(frame);
   const image = state.images.get(url);
   if (image) state.viewer.show(image);
   else state.viewer.showURL(url);
 
-  SliderControls.get("frame")?.setValue(state.index, { silent: true });
-  $("caption").textContent = captionFor(frame, state.index, n);
+  SliderControls.get("frame")?.setValue(sliderPosition(state.index), { silent: true });
+  updateCaption();
   renderFrameInfo(frame);
   updateMarker(frame);
+  updateColorbar();
   highlightRow();
+  state.plots?.setCurrent(state.index);
   if (!state.playing) syncURL();
 }
 
 function captionFor(frame, index, total) {
   const flux = frame.flux_ujy === null ? "flux -" : `flux ${fmt(frame.flux_ujy, 1)} uJy`;
   const snr = frame.peak_snr === null ? "S/N -" : `peak S/N ${fmt(frame.peak_snr, 1)}`;
-  return `${index + 1}/${total}   ${frame.date}   ${frame.band_label}   ` +
+  return `${positionText(index, total)}   ${frame.date}   ${frame.band_label}   ` +
          `${fmt(frame.wavelength_um, 2)} um   ${flux}   ${snr}` +
          (frame.target_bad ? "   [target pixel flagged]" : "");
 }
@@ -834,22 +904,427 @@ function updateMarker(frame) {
 }
 
 // --------------------------------------------------------------------------
+// Frame filters: ticked frames and the wavelength window.  Client-side only.
+//
+// A frame is "visible" when it is ticked and inside the wavelength window.
+// Visible frames drive Play, +1/-1, the frame slider, the A/B lists and the
+// plots.  Every frame keeps its manifest index, so the server never sees the
+// filter and /api/diff still takes original indices.
+// --------------------------------------------------------------------------
+
+function frameKey(frame) {
+  return `${frame.obs_id}|${frame.band}`;
+}
+
+function isBlended(frame) {
+  const off = frame.centroid_offset_px;
+  if (!Array.isArray(off) || !Number.isFinite(off[0]) || !Number.isFinite(off[1])) {
+    return false;
+  }
+  return Math.hypot(off[0], off[1]) > BLEND_PX;
+}
+
+function passesFilters(frame) {
+  if (state.excluded.has(frameKey(frame))) return false;
+  const wl = state.filter.wl;
+  if (wl) {
+    const lam = frame.wavelength_um;
+    if (!Number.isFinite(lam) || lam < wl[0] - 1e-9 || lam > wl[1] + 1e-9) return false;
+  }
+  return true;
+}
+
+function sameField(a, b) {
+  if (!a || !b) return false;
+  if (Number.isFinite(a.ra) && Number.isFinite(b.ra)) {
+    return Math.abs(a.ra - b.ra) < 1e-6 && Math.abs(a.dec - b.dec) < 1e-6;
+  }
+  return a.name === b.name;
+}
+
+/** Indices from a shared URL refer to the complete dataset, not the preview. */
+function adoptPendingSkip(manifest) {
+  if (!state.wantSkip || manifest.complete === false) return;
+  for (const index of state.wantSkip) {
+    const frame = manifest.frames?.[index];
+    if (frame) state.excluded.add(frameKey(frame));
+  }
+  state.wantSkip = null;
+}
+
+function recomputeVisible({ resetCompare = false } = {}) {
+  const frames = state.frames;
+  state.visible = frames.map(passesFilters);
+  state.order = [];
+  state.visible.forEach((ok, i) => { if (ok) state.order.push(i); });
+
+  const slider = SliderControls.get("frame");
+  slider?.setBounds(0, Math.max(0, state.order.length - 1));
+  slider?.setDisabled(state.order.length === 0);
+  slider?.setValue(sliderPosition(state.index), { silent: true });
+
+  paintTableVisibility();
+  updateFilterCount();
+  if (resetCompare) fillCompare({ reset: true });
+  else scheduleCompareRefresh();
+  state.plots?.update(frames, state.visible);
+  if (state.order.length === 0 && state.playing) pause();
+  updateCaption();
+}
+
+function scheduleCompareRefresh() {
+  if (state.compareRefresh) return;
+  state.compareRefresh = requestAnimationFrame(() => {
+    state.compareRefresh = 0;
+    fillCompare();
+  });
+}
+
+/** Position in `order` of the first visible frame at or after `index`. */
+function visiblePosition(index) {
+  const order = state.order;
+  let low = 0;
+  let high = order.length;
+  while (low < high) {
+    const mid = (low + high) >> 1;
+    if (order[mid] < index) low = mid + 1;
+    else high = mid;
+  }
+  return low;
+}
+
+function sliderPosition(index) {
+  return Math.min(visiblePosition(index), Math.max(0, state.order.length - 1));
+}
+
+/** Move by one visible frame, wrapping at both ends. */
+function stepVisible(delta) {
+  const order = state.order;
+  if (!order.length) return;
+  const pos = visiblePosition(state.index);
+  let next;
+  if (order[pos] === state.index) {
+    next = pos + delta;
+  } else {
+    // The current frame is hidden: `pos` is the first visible frame after it.
+    next = delta > 0 ? pos + delta - 1 : pos + delta;
+  }
+  next = ((next % order.length) + order.length) % order.length;
+  setIndex(order[next]);
+}
+
+function positionText(index, total) {
+  const shown = state.order.length;
+  if (shown === total) return `${index + 1}/${total}`;
+  if (!state.visible[index]) return `${index + 1}/${total} (hidden by filters)`;
+  return `${index + 1}/${total} (${visiblePosition(index) + 1}/${shown} shown)`;
+}
+
+function updateCaption() {
+  const frame = state.frames[state.index];
+  if (!frame || state.mode !== "movie") return;
+  $("caption").textContent = captionFor(frame, state.index, state.frames.length);
+}
+
+function paintTableVisibility() {
+  const rows = $("frameRows").rows;
+  for (let i = 0; i < rows.length; i++) {
+    rows[i].classList.toggle("off", !state.visible[i]);
+  }
+}
+
+function syncCheckboxes() {
+  $("frameRows").querySelectorAll("input[data-pick]").forEach(box => {
+    const frame = state.frames[parseInt(box.dataset.pick, 10)];
+    if (frame) box.checked = !state.excluded.has(frameKey(frame));
+  });
+}
+
+function updateFilterCount() {
+  const note = $("filterCount");
+  const total = state.frames.length;
+  if (!total) {
+    note.textContent = "";
+    note.classList.remove("error");
+    return;
+  }
+  const shown = state.order.length;
+  const parts = [`Showing ${shown} of ${total} frames.`];
+  let unticked = 0;
+  for (const frame of state.frames) {
+    if (state.excluded.has(frameKey(frame))) unticked += 1;
+  }
+  if (unticked) parts.push(`${unticked} unticked.`);
+  if (state.filter.wl) {
+    parts.push(`Window ${fmt(state.filter.wl[0], 2)} to ${fmt(state.filter.wl[1], 2)} um.`);
+  }
+  if (shown === 0) parts.push("Nothing to play: widen the window or tick some frames.");
+  note.textContent = parts.join(" ");
+  note.classList.toggle("error", shown === 0);
+}
+
+function setExcluded(index, excluded) {
+  const frame = state.frames[index];
+  if (!frame) return;
+  if (excluded) state.excluded.add(frameKey(frame));
+  else state.excluded.delete(frameKey(frame));
+  recomputeVisible();
+  syncURLSoon();
+}
+
+function excludeWhere(predicate) {
+  for (const frame of state.frames) {
+    if (predicate(frame)) state.excluded.add(frameKey(frame));
+  }
+  syncCheckboxes();
+  recomputeVisible();
+  syncURLSoon();
+}
+
+function resetFilters({ quiet = false } = {}) {
+  state.excluded.clear();
+  state.filter.wl = null;
+  if (state.wlBounds) paintWavelengthSliders();
+  syncCheckboxes();
+  recomputeVisible();
+  if (!quiet) syncURLSoon();
+}
+
+// --- wavelength window ----------------------------------------------------
+
+function setupWavelengthSliders(frames) {
+  const low = SliderControls.get("wlmin");
+  const high = SliderControls.get("wlmax");
+  if (!low || !high) return;
+
+  const lams = frames.map(f => f.wavelength_um).filter(Number.isFinite);
+  if (!lams.length) {
+    state.wlBounds = null;
+    low.setDisabled(true);
+    high.setDisabled(true);
+    return;
+  }
+  // Round outwards to the slider step so the full range is always reachable.
+  const min = Math.floor(Math.min(...lams) * 100) / 100;
+  const max = Math.ceil(Math.max(...lams) * 100) / 100;
+  state.wlBounds = [min, max];
+  low.setDisabled(false);
+  high.setDisabled(false);
+  low.setBounds(min, max);
+  high.setBounds(min, max);
+  paintWavelengthSliders();
+}
+
+/** Show state.filter.wl (or the full range) on the two sliders, silently. */
+function paintWavelengthSliders() {
+  if (!state.wlBounds) return;
+  const [min, max] = state.wlBounds;
+  const wl = state.filter.wl;
+  SliderControls.get("wlmin")?.setValue(wl ? wl[0] : min, { silent: true });
+  SliderControls.get("wlmax")?.setValue(wl ? wl[1] : max, { silent: true });
+}
+
+function changeWavelength(value, controller) {
+  const low = SliderControls.get("wlmin");
+  const high = SliderControls.get("wlmax");
+  if (!low || !high) return;
+  // Keep min <= max by pushing the other handle along.
+  if (controller.name === "wlmin" && value > high.value) high.setValue(value, { silent: true });
+  if (controller.name === "wlmax" && value < low.value) low.setValue(value, { silent: true });
+
+  if (!state.wlBounds) {
+    state.filter.wl = null;
+    return;
+  }
+  const [min, max] = state.wlBounds;
+  const full = low.value <= min + 1e-9 && high.value >= max - 1e-9;
+  state.filter.wl = full ? null : [low.value, high.value];
+  recomputeVisible();
+  syncURLSoon();
+}
+
+// --------------------------------------------------------------------------
+// Display levels and the colourbar
+//
+// The PNG maps each frame's stretch [lo, hi] (MJy/sr above the frame's median
+// sky) onto grey levels 1..255, with 0 reserved for "no data".  A level g is
+// therefore  lo + (g - 1) / 254 * (hi - lo).  The black and white levels are
+// fractions s of that stretch (0 = lo, 1 = hi); in the shader they become the
+// texture values (1 + 254 s) / 255.  This can only re-window what the PNG
+// already holds: pixels clipped at the 1st or 99.5th percentile stay clipped.
+// --------------------------------------------------------------------------
+
+function changeLevels(value, controller) {
+  const black = SliderControls.get("black");
+  const white = SliderControls.get("white");
+  if (!black || !white) return;
+  if (controller.name === "black" && value > white.value - LEVEL_GAP) {
+    black.setValue(white.value - LEVEL_GAP, { silent: true });
+  }
+  if (controller.name === "white" && value < black.value + LEVEL_GAP) {
+    white.setValue(black.value + LEVEL_GAP, { silent: true });
+  }
+  state.levels = { black: black.value / 100, white: white.value / 100 };
+  applyLevelsToView();
+  syncURLSoon();
+}
+
+function resetLevels() {
+  SliderControls.get("black")?.setValue(0, { silent: true });
+  SliderControls.get("white")?.setValue(100, { silent: true });
+  state.levels = { black: 0, white: 1 };
+  applyLevelsToView();
+  syncURLSoon();
+}
+
+function levelsForViewer() {
+  const { black, white } = state.levels;
+  // Difference images carry their own 3-sigma stretch: never re-window them.
+  if (state.mode !== "movie" || (black <= 0 && white >= 1)) return [0, 1];
+  return [(1 + black * 254) / 255, (1 + white * 254) / 255];
+}
+
+function pushLevels() {
+  state.viewer.setLevels(...levelsForViewer());
+}
+
+function applyLevelsToView() {
+  pushLevels();
+  updateColorbar();
+}
+
+function updateColorbar() {
+  const bar = $("colorbar");
+  const frame = state.frames[state.index];
+  const stretch = frame ? state.manifest?.stretch?.[frame.band] : null;
+  const ok = state.mode === "movie" && Array.isArray(stretch) &&
+             Number.isFinite(stretch[0]) && Number.isFinite(stretch[1]) &&
+             stretch[1] > stretch[0];
+  if (!ok) {
+    bar.hidden = true;
+    state.colorbarKey = "";
+    return;
+  }
+  bar.hidden = false;
+
+  const key = `${frame.band}|${state.levels.black}|${state.levels.white}`;
+  if (key === state.colorbarKey) return;
+  state.colorbarKey = key;
+
+  const [lo, hi] = stretch;
+  const span = hi - lo;
+  const from = lo + state.levels.black * span;
+  const to = lo + state.levels.white * span;
+  // Enough decimals that neighbouring ticks (a quarter of the range apart)
+  // still differ in their second significant digit.
+  const decimals = Math.min(6, Math.max(0, Math.ceil(-Math.log10((to - from) / 4)) + 1));
+  const ticks = $("cbTicks").children;
+  for (let k = 0; k < ticks.length; k++) {
+    ticks[k].textContent = (from + ((to - from) * k) / (ticks.length - 1)).toFixed(decimals);
+  }
+  $("cbCaption").textContent =
+    `MJy/sr above sky, ${frame.band_label} scale (each frame's median removed)`;
+}
+
+// --------------------------------------------------------------------------
+// Shareable view state: wavelength window, unticked frames, display levels
+// --------------------------------------------------------------------------
+
+function readViewStateFromQuery(query) {
+  const number = key => {
+    const value = parseFloat(query.get(key));
+    return Number.isFinite(value) ? value : null;
+  };
+
+  const lo = number("lo");
+  const hi = number("hi");
+  if (lo !== null || hi !== null) {
+    const black = Math.min(Math.max(lo ?? 0, 0), 100 - LEVEL_GAP);
+    const white = Math.max(Math.min(hi ?? 100, 100), black + LEVEL_GAP);
+    SliderControls.get("black")?.setValue(black, { silent: true });
+    SliderControls.get("white")?.setValue(white, { silent: true });
+    state.levels = { black: black / 100, white: white / 100 };
+  }
+
+  const w0 = number("wl0");
+  const w1 = number("wl1");
+  if (w0 !== null && w1 !== null && w1 >= w0) state.filter.wl = [w0, w1];
+
+  const skip = decodeRanges(query.get("skip"));
+  state.wantSkip = skip.length ? skip : null;
+}
+
+function skippedIndices() {
+  const out = [];
+  state.frames.forEach((frame, i) => {
+    if (state.excluded.has(frameKey(frame))) out.push(i);
+  });
+  return out;
+}
+
+/** [3, 4, 5, 9] -> "3-5,9" */
+function encodeRanges(indices) {
+  const parts = [];
+  let i = 0;
+  while (i < indices.length) {
+    let j = i;
+    while (j + 1 < indices.length && indices[j + 1] === indices[j] + 1) j += 1;
+    parts.push(j > i ? `${indices[i]}-${indices[j]}` : String(indices[i]));
+    i = j + 1;
+  }
+  return parts.join(",");
+}
+
+/** "3-5,9" -> [3, 4, 5, 9]; anything that is not a number or a range is ignored. */
+function decodeRanges(text) {
+  const out = [];
+  if (!text) return out;
+  for (const part of text.split(",")) {
+    const match = /^(\d+)(?:-(\d+))?$/.exec(part.trim());
+    if (!match) continue;
+    const first = parseInt(match[1], 10);
+    const last = match[2] === undefined ? first : parseInt(match[2], 10);
+    for (let k = first; k <= Math.min(last, first + 100000); k++) out.push(k);
+  }
+  return out;
+}
+
+/** Slider drags fire many events; history.replaceState is rate limited in some browsers. */
+function syncURLSoon() {
+  clearTimeout(state.urlTimer);
+  state.urlTimer = setTimeout(syncURL, 200);
+}
+
+// --------------------------------------------------------------------------
 // A-B / (A+B)/2
 // --------------------------------------------------------------------------
 
-function fillCompare(frames) {
-  const options = frames.map((frame, index) =>
-    `<option value="${index}">#${String(index).padStart(3, "0")}  ${frame.date}  ` +
-    `${frame.band_label}  ${fmt(frame.wavelength_um, 2)} um</option>`).join("");
+function fillCompare({ reset = false } = {}) {
+  const frames = state.frames;
+  const previousA = $("aSelect").value;
+  const previousB = $("bSelect").value;
+
+  // Only visible frames are offered, but the option values stay manifest
+  // indices because that is what /api/diff expects.
+  const options = state.order.map(index => {
+    const frame = frames[index];
+    return `<option value="${index}">#${String(index).padStart(3, "0")}  ${frame.date}  ` +
+           `${frame.band_label}  ${fmt(frame.wavelength_um, 2)} um</option>`;
+  }).join("");
   $("aSelect").innerHTML = options;
   $("bSelect").innerHTML = options;
 
-  // Default to the first and last frame of the first detector that appears.
-  const band = frames[0]?.band;
-  const same = frames.map((f, i) => f.band === band ? i : -1).filter(i => i >= 0);
+  const keepA = !reset && Boolean(state.visible[parseInt(previousA, 10)]);
+  const keepB = !reset && Boolean(state.visible[parseInt(previousB, 10)]);
+  if (keepA) $("aSelect").value = previousA;
+  if (keepB) $("bSelect").value = previousB;
+
+  // Otherwise default to the first and last frame of the first detector shown.
+  const band = state.order.length ? frames[state.order[0]].band : null;
+  const same = state.order.filter(i => frames[i].band === band);
   if (same.length) {
-    $("aSelect").value = same[0];
-    $("bSelect").value = same[same.length - 1];
+    if (!keepA) $("aSelect").value = same[0];
+    if (!keepB) $("bSelect").value = same[same.length - 1];
   }
 }
 
@@ -876,6 +1351,7 @@ function showDiff(mode) {
 
   pause();
   state.mode = "diff";
+  applyLevelsToView();          // difference images are never re-windowed
   state.viewer.showURL(diffURL(a, b, mode));
   $("legend").hidden = mode !== "sub";
   $("legend").textContent = mode === "sub"
@@ -896,6 +1372,7 @@ function backToMovie(silent = false) {
     $("backBtn").hidden = true;
     $("legend").hidden = true;
     $("playBtn").disabled = false;
+    applyLevelsToView();
     return;
   }
   setIndex(state.index);
@@ -956,16 +1433,29 @@ function renderFrameInfo(frame) {
 }
 
 function renderTable(frames) {
-  $("frameRows").innerHTML = frames.map((frame, index) =>
-    `<tr data-i="${index}">` +
-    `<td>${index}</td>` +
-    `<td>${frame.date}</td>` +
-    `<td>${frame.band_label}</td>` +
-    `<td>${fmt(frame.wavelength_um, 2)}</td>` +
-    `<td>${frame.flux_ujy === null ? "-" : fmt(frame.flux_ujy, 0)}</td>` +
-    `<td>${fmt(frame.peak_snr, 1)}</td>` +
-    `<td>${frame.target_bad ? "!" : ""}</td>` +
-    `</tr>`).join("");
+  $("frameRows").innerHTML = frames.map((frame, index) => {
+    const used = !state.excluded.has(frameKey(frame));
+    let flag = "";
+    let title = "";
+    if (frame.target_bad) {
+      flag = "!";
+      title = "target pixel has a bad flag";
+    } else if (isBlended(frame)) {
+      flag = "b";
+      title = "centroid is more than half a pixel from the target: probably blended";
+    }
+    return `<tr data-i="${index}">` +
+      `<td class="pick"><input type="checkbox" data-pick="${index}" ` +
+      `aria-label="Use frame ${index}"${used ? " checked" : ""}></td>` +
+      `<td>${index}</td>` +
+      `<td>${frame.date}</td>` +
+      `<td>${frame.band_label}</td>` +
+      `<td>${fmt(frame.wavelength_um, 2)}</td>` +
+      `<td>${frame.flux_ujy === null ? "-" : fmt(frame.flux_ujy, 0)}</td>` +
+      `<td>${fmt(frame.peak_snr, 1)}</td>` +
+      `<td title="${title}">${flag}</td>` +
+      `</tr>`;
+  }).join("");
 }
 
 function highlightRow() {
@@ -1051,6 +1541,19 @@ function syncURL() {
   params.set("fps", state.fps);
   params.set("frame", state.index);
   params.set("interp", state.interp);
+  if (state.filter.wl) {
+    params.set("wl0", state.filter.wl[0]);
+    params.set("wl1", state.filter.wl[1]);
+  }
+  // Unticked indices only mean something for the complete dataset; during a
+  // preview keep whatever the shared link asked for.
+  const complete = state.manifest && state.manifest.complete !== false;
+  const skipText = complete
+    ? encodeRanges(skippedIndices())
+    : (state.wantSkip ? encodeRanges(state.wantSkip) : "");
+  if (skipText) params.set("skip", skipText);
+  if (state.levels.black > 0) params.set("lo", Math.round(state.levels.black * 100));
+  if (state.levels.white < 1) params.set("hi", Math.round(state.levels.white * 100));
   if (state.playing) params.set("play", "1");
   if (document.body.classList.contains("embed")) params.set("embed", "1");
 

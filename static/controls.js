@@ -150,7 +150,14 @@ const SliderControls = (() => {
       if (spec.onInput) spec.onInput(current, controller);
     });
     range.addEventListener("change", () => {
-      setValue(range.value, { commit: true });
+      // The "input" handler above has already moved `current` to this value,
+      // so setValue() would see no change and never call onCommit.  Commit
+      // on release explicitly.
+      const next = normalise(range.value, min, max, spec.step ?? 1);
+      if (next === null) return;
+      current = next;
+      paint();
+      if (spec.onCommit) spec.onCommit(current, controller);
     });
 
     // Type a value: move the thumb immediately, but only commit on blur or

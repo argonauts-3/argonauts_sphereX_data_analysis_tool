@@ -84,6 +84,11 @@
         <canvas id="view" aria-label="SPHEREx frame">Your browser does not support canvas.</canvas>
         <div id="targetMarker" hidden></div>
       </div>
+      <div id="colorbar" hidden>
+        <div id="cbBar" aria-hidden="true"></div>
+        <div id="cbTicks"><span></span><span></span><span></span><span></span><span></span></div>
+        <div id="cbCaption"></div>
+      </div>
     </div>
 
     <div id="previewBanner" hidden></div>
@@ -108,6 +113,12 @@
 
       <button id="backBtn" type="button" hidden>Back to movie</button>
     </div>
+
+    <div id="levelsRow" title="Re-window the image inside its baked stretch. Raising the black level also turns faint pixels black, so black no longer means only 'no data'.">
+      <span class="transport-slider" data-slider="black"></span>
+      <span class="transport-slider" data-slider="white"></span>
+      <button id="levelsResetBtn" type="button">Reset levels</button>
+    </div>
     <p id="viewerNotice" class="note" hidden>WebGL is unavailable, so only Nearest and smooth
       (bilinear) display scaling are available.</p>
 
@@ -120,6 +131,20 @@
       </div>
       <div id="progressTrack"><div id="progressBar"></div></div>
     </div>
+
+    <section id="plots">
+      <div id="plotsHead">
+        <h2>Measurements</h2>
+        <div id="plotTabs" role="tablist">
+          <button type="button" role="tab" data-plot="spectrum" aria-selected="true">Spectrum</button>
+          <button type="button" role="tab" data-plot="lightcurve" aria-selected="false">Light curve</button>
+        </div>
+        <button type="button" data-role="csv" title="Every frame, with a column that says which are shown">Download CSV</button>
+      </div>
+      <div data-role="box"></div>
+      <p class="note" data-role="note"></p>
+      <p class="note" data-role="legend"></p>
+    </section>
   </section>
 
   <aside id="side">
@@ -151,11 +176,23 @@
         bands is not a difference image.</p>
     </section>
 
-    <section>
+    <section id="framesBox">
       <h2>Frames</h2>
+      <div id="wlFilter">
+        <div class="field" data-slider="wlmin"></div>
+        <div class="field" data-slider="wlmax"></div>
+      </div>
+      <div id="frameTools" class="buttons">
+        <button id="resetFilterBtn" type="button" title="Tick every frame and open the wavelength window fully">Reset</button>
+        <button id="selNoneBtn" type="button" title="Untick every frame">None</button>
+        <button id="dropFlaggedBtn" type="button" title="Untick frames whose target pixel has a bad flag">Drop flagged</button>
+        <button id="dropFaintBtn" type="button" title="Untick frames with a measured peak S/N below 3">Drop S/N &lt; 3</button>
+        <button id="dropBlendedBtn" type="button" title="Untick frames whose centroid is more than half a pixel from the target (noisy for faint targets)">Drop blended</button>
+      </div>
+      <p class="note" id="filterCount"></p>
       <div id="tableWrap">
         <table>
-          <thead><tr><th>#</th><th>date</th><th>det</th><th>um</th><th>uJy</th><th>S/N</th><th>flag</th></tr></thead>
+          <thead><tr><th class="pick" title="Untick to leave a frame out of Play, the plots and the A/B lists">use</th><th>#</th><th>date</th><th>det</th><th>um</th><th>uJy</th><th>S/N</th><th>flag</th></tr></thead>
           <tbody id="frameRows"></tbody>
         </table>
       </div>
@@ -208,6 +245,28 @@
       display kernel and playback state. Add <code>embed=1</code> to hide the
       form and side panels.</p>
 
+    <h3>Colourbar and levels</h3>
+    <p>The bar under the image gives the scale in MJy/sr above each frame's own
+      median sky, for the detector on screen. The black and white levels
+      (percent of that scale) re-window the image instantly. They cannot reveal
+      pixels already clipped at the 1st and 99.5th percentile, and raising the
+      black level also turns faint pixels black, so black then no longer means
+      only &ldquo;no data&rdquo;. Difference images keep their own stretch.</p>
+
+    <h3>Frames: tick boxes and wavelength window</h3>
+    <p>Untick frames, drop flagged, faint or blended ones, or narrow the
+      wavelength window. Hidden frames are skipped by Play, the frame slider
+      and the A/B lists, and appear hollow in the plots. Clicking a hidden
+      frame still shows it. These choices are saved in the URL
+      (<code>wl0</code>, <code>wl1</code>, <code>skip</code>,
+      <code>lo</code>, <code>hi</code>).</p>
+
+    <h3>Measurements</h3>
+    <p>The spectrum plots aperture flux against wavelength; the light curve
+      plots it against date. SPHEREx samples a different wavelength on each
+      visit, so compare epochs only inside a narrow wavelength window. Click a
+      point to open its frame. The white ring is the frame on screen.</p>
+
     <p class="guide-more"><a href="/guide" target="_blank" rel="noopener">Open the full guide (GUIDE.md)</a></p>
   </div>
 </dialog>
@@ -226,6 +285,7 @@
 
 <script src="/static/controls.js"></script>
 <script src="/static/viewer.js"></script>
+<script src="/static/plots.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

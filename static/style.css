@@ -7,6 +7,10 @@
   --accent: #6cb6ff;
   --warn: #ffb347;
   --bad: #ff6b6b;
+  /* Width of the frame and of the colourbar under it.  The 410 px reserve
+     covers the form above and the transport, levels, colourbar and caption
+     below, so Play stays on screen without scrolling. */
+  --stage-size: min(100%, calc(100vh - 410px), 760px);
 }
 
 * { box-sizing: border-box; }
@@ -109,17 +113,14 @@ main {
 
 #viewer { min-width: 0; }
 
-#stageWrap { display: flex; justify-content: center; }
+#stageWrap { display: flex; flex-direction: column; align-items: center; }
 
 #stage {
   position: relative;
   /* Size the box, not the image.  A percentage width on the canvas would be
      resolved against this shrink-to-fit box, which is itself sized by the
-     image, so the image would never grow.
-
-     The 370 px reserve is for the form above and the transport/caption below,
-     so Play stays on screen without scrolling. */
-  width: min(100%, calc(100vh - 370px), 760px);
+     image, so the image would never grow.  See --stage-size in :root. */
+  width: var(--stage-size);
   aspect-ratio: 1 / 1;
   background: #000;
   border: 1px solid var(--line);
@@ -162,7 +163,8 @@ main {
   text-align: center;
 }
 
-#transport {
+#transport,
+#levelsRow {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -239,12 +241,12 @@ th {
   font-weight: 500;
   border-bottom: 1px solid var(--line);
 }
-td:nth-child(2) { text-align: left; }
+td:nth-child(3) { text-align: left; }
 tbody tr { cursor: pointer; border-bottom: 1px solid #1d232b; }
 tbody tr:hover { background: #1d242e; }
 tbody tr.current { background: #243244; color: #fff; }
 
-#frameRows td:first-child { color: var(--muted); }
+#frameRows td:nth-child(2) { color: var(--muted); }
 
 body.embed #top, body.embed #side { display: none; }
 body.embed main { grid-template-columns: 1fr; padding-top: 10px; }
@@ -304,6 +306,66 @@ body.embed main { grid-template-columns: 1fr; padding-top: 10px; }
 
 @media (max-width: 980px) {
   main { grid-template-columns: 1fr; }
-  #stage { width: min(100%, calc(100vh - 370px), 760px); }
+  #stage { width: var(--stage-size); }
   .transport-slider .slider input[type="range"] { width: 120px; }
+}
+
+/* Colourbar under the frame: MJy/sr above each frame's median sky. */
+#colorbar { width: var(--stage-size); margin-top: 6px; }
+#cbBar {
+  height: 10px;
+  border: 1px solid var(--line);
+  background: linear-gradient(to right, #000, #fff);
+}
+#cbTicks {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 2px;
+  font: 11px/1.3 ui-monospace, "SF Mono", Menlo, monospace;
+  color: var(--muted);
+}
+#cbCaption { margin-top: 1px; font-size: 11px; color: var(--muted); text-align: center; }
+
+#levelsRow { margin-top: 6px; padding: 6px 8px; }
+#levelsResetBtn { padding: 2px 8px; font-size: 12px; }
+
+/* Frame filters */
+#wlFilter { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+#wlFilter .pair input[type="range"] { width: 140px; }
+#frameTools { margin-bottom: 4px; }
+#frameTools button { padding: 2px 8px; font-size: 12px; }
+#filterCount { margin: 4px 0 8px; }
+th.pick, td.pick { width: 26px; padding: 3px 2px; text-align: center; }
+tbody tr.off { opacity: .42; }
+tbody tr.off.current { opacity: .75; }
+
+/* Measurements plots */
+#plots {
+  margin-top: 14px;
+  padding: 10px 12px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+#plotsHead { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-bottom: 8px; }
+#plotsHead h2 { margin: 0; }
+#plotTabs { display: flex; gap: 6px; flex: 1; }
+#plotTabs button[aria-selected="true"] { border-color: var(--accent); background: #243244; color: #fff; }
+#plots [data-role="box"] svg { display: block; width: 100%; height: auto; }
+#plots .plot-empty { margin: 16px 0; color: var(--muted); font-size: 12.5px; }
+#plots .grid { stroke: #232b36; stroke-width: 1; }
+#plots .axis { stroke: #4a5666; stroke-width: 1; }
+#plots .zero { stroke: #5b6878; stroke-dasharray: 4 3; }
+#plots .tick { fill: var(--muted); font-size: 10.5px; }
+#plots .label { fill: var(--muted); font-size: 11px; }
+#plots [data-i] { cursor: pointer; }
+#plots [data-i]:hover { stroke: #fff; stroke-width: 1.5; }
+#plots .note.warn { color: var(--warn); }
+#plots .swatch {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  margin-right: 3px;
+  border-radius: 50%;
+  vertical-align: -1px;
 }
