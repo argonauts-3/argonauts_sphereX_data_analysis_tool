@@ -26,6 +26,11 @@ Set a wavelength centre by typing an exact value or using the slider. The tolera
 
 The app queries the `spherex_dr1` and `spherex_qr3` collections through IRSA's Simple Image Access service. See [SPHEREx data access](https://irsa.ipac.caltech.edu/spherex-archive-documentation/spherex-data-access/) and [IRSA SIA v2 documentation](https://irsa.ipac.caltech.edu/ibe/sia.html).
 
+## License
+
+Project source code is available under the MIT License; see [LICENSE](LICENSE).
+SPHEREx data and other third-party materials retain their own source terms.
+
 ## Getting started: Docker (recommended)
 
 Docker provides the same Python environment on Linux, macOS, and Windows.
