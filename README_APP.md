@@ -6,7 +6,8 @@ each one, aligns them all onto the same north-up grid, and lets you blink
 through them.  There is also an A-B / (A+B)/2 view for comparing two epochs.
 
 This is the functional prototype, not the final public tool: the visuals are
-plain on purpose and everything runs locally.
+plain on purpose and everything runs locally.  For a dated snapshot of what
+is built, what is cached and what remains, see `PROGRESS.md`.
 
 ## Run it
 
@@ -123,10 +124,14 @@ list in `test.py`:
 COLLECTIONS = ("spherex_dr1", "spherex_qr3", "spherex_dr2")
 ```
 
-Nothing else changes: the query stacks every collection into one exposure
-list, so new frames appear in the same movie.  If the manifest gains a field,
-bump `dataset.VERSION`; it is part of the dataset id, so old cached datasets
-are rebuilt instead of being served with a page that expects something else.
+The query stacks every collection into one exposure list, so new frames appear
+in the same movie.  Two caches must be refreshed after changing the list:
+
+- Delete the relevant `cutout_cache/exposures_*.ecsv` file(s).  Otherwise the
+  old archive answer is reused and the new release stays invisible.
+- Bump `dataset.VERSION`.  It is part of the dataset id, so existing datasets
+  rebuild instead of being served with the old frame list (or an old manifest
+  schema).
 
 ## Not in this prototype
 
