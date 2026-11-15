@@ -307,8 +307,19 @@ def api_build():
         # No job, a failed job, or a "ready" job whose directory was deleted:
         # all of those need a new build.  A queued/running job is left alone.
         if job is None or job.get("state") in ("error", "ready"):
+            # The newest request wins.  A build that is already running is
+            # left alone (it is downloading real data), but older requests
+            # that are still queued are dropped so they do not pile up while
+            # the user clicks through targets.
+            for other_key, other in JOBS.items():
+                if other_key != key and other.get("state") == "queued":
+                    other.update(
+                        state="error", stage="error",
+                        error="That build was replaced by a newer request. "
+                              "Click Show again to run it.")
             JOBS[key] = {"state": "queued", "stage": "queued",
-                         "done": 0, "total": 0, "error": None}
+                         "done": 0, "total": 0, "error": None,
+                         "name": params["name"], "fov": params["fov"]}
             EXECUTOR.submit(_run_build, key, params)
     return jsonify(id=key, state="queued", params=public_params(params))
 
@@ -321,6 +332,19 @@ def api_job(key):
         return jsonify(id=key, state="ready")
     with JOBS_LOCK:
         job = dict(JOBS.get(key, {}))
+        if job.get("state") == "queued":
+            # Say what the one build worker is doing, otherwise "Queued" can
+            # look like a frozen page when a long download is ahead of it.
+            for other_key, other in JOBS.items():
+                if other_key != key and other.get("state") == "running":
+                    job["queued_behind"] = {
+                        "name": other.get("name") or "another build",
+                        "fov": other.get("fov"),
+                        "stage": other.get("stage"),
+                        "done": other.get("done", 0),
+                        "total": other.get("total", 0),
+                    }
+                    break
     if not job:
         return jsonify(error="unknown dataset"), 404
     return jsonify(id=key, **job)

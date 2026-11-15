@@ -403,8 +403,19 @@ async function startBuild(request) {
       return;
     }
     const label = STAGE_LABEL[job.stage] || job.stage || "Working";
-    const fraction = job.total > 0 ? job.done / job.total : null;
-    showProgress(label + (job.total > 0 ? ` (${job.done}/${job.total})` : ""), fraction);
+    const behind = job.queued_behind;
+    let text = label + (job.total > 0 ? ` (${job.done}/${job.total})` : "");
+    let fraction = job.total > 0 ? job.done / job.total : null;
+    if (behind) {
+      // One build runs at a time.  Show that the queue is moving instead of
+      // leaving the user staring at an unexplained "Queued".
+      const behindLabel = STAGE_LABEL[behind.stage] || behind.stage || "working";
+      const field = Number.isFinite(behind.fov) ? `, ${behind.fov.toFixed(2)} deg` : "";
+      text = `Waiting for ${behind.name}${field}: ${behindLabel}` +
+             (behind.total > 0 ? ` (${behind.done}/${behind.total})` : "");
+      fraction = behind.total > 0 ? behind.done / behind.total : null;
+    }
+    showProgress(text, fraction);
     await sleep(800);
   }
 }
