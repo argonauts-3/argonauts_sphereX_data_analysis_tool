@@ -104,11 +104,14 @@ The A/B Comparison tool enables visual differencing between two epochs:
 ### Multi-frame S/N stack
 
 Use the **Stack similar wavelengths** panel to combine more than two images.
-Choose one detector, type an exact wavelength centre (or choose a suggested
-centre from wavelengths present in the frames), set the ± tolerance in microns,
-and optionally set start/end dates. Only rows still ticked in the Frames table
-are candidates; the stack then applies the detector, wavelength, and date
-limits. At least two images must match. Stacks never mix detectors by default.
+Type an exact wavelength centre (or choose a suggested centre from the frames),
+use the wavelength slider, set the ± tolerance in microns, and optionally set
+start/end dates. The slider spans the minimum to maximum wavelength available
+in the current dataset. Only rows still ticked in the Frames table are
+candidates. All detectors are eligible; if the wavelength window reaches more
+than one detector, the selection summary lists their counts and warns that
+detector responses and point-spread functions may differ. At least two images
+must match.
 
 The app reprocesses the selected cached FITS cutouts, aligns each image on the
 target, subtracts a local residual sky level, and calculates a per-pixel

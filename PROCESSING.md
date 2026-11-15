@@ -9,15 +9,91 @@ images, aligns them, and then makes smaller display files.
 ## At a glance
 
 ```mermaid
+flowchart LR
+    INPUT[Target position<br/>and observation criteria] --> SEARCH[Find SPHEREx<br/>observations]
+    SEARCH --> SELECT[Select exposures by<br/>coverage, date, detector]
+    SELECT --> FITS[Retrieve calibrated<br/>FITS cutouts]
+    FITS --> MEASURE[Check quality; measure<br/>brightness and wavelength]
+    MEASURE --> ALIGN[Align images to a shared<br/>north-up grid]
+    ALIGN --> FRAMES[Time-ordered images<br/>and measurements]
+    FRAMES --> OUTPUT[Time-series data<br/>for viewing and analysis]
+    FRAMES --> STACKSEL{Make a<br/>multi-frame stack?}
+    STACKSEL -- No --> OUTPUT
+    STACKSEL -- Yes --> WAVELENGTH[Select by wavelength,<br/>dates, and exclusions]
+    WAVELENGTH --> REPROCESS[Reprocess FITS and<br/>align on the target]
+    REPROCESS --> COMBINE[Mask invalid pixels;<br/>combine by inverse variance]
+    COMBINE --> STACKOUT[Stacked image,<br/>uncertainty, coverage]
+
+    classDef input fill:#dbeafe,stroke:#2563eb,color:#172554,stroke-width:2px
+    classDef archive fill:#ffedd5,stroke:#ea580c,color:#431407,stroke-width:2px
+    classDef processing fill:#ede9fe,stroke:#7c3aed,color:#2e1065,stroke-width:2px
+    classDef product fill:#dcfce7,stroke:#16a34a,color:#052e16,stroke-width:2px
+    classDef optional fill:#fef3c7,stroke:#d97706,color:#451a03,stroke-width:2px
+    class INPUT input
+    class SEARCH,SELECT,FITS archive
+    class MEASURE,ALIGN processing
+    class FRAMES,OUTPUT product
+    class STACKSEL,WAVELENGTH,REPROCESS,COMBINE,STACKOUT optional
+```
+
+### Observation search and movie build
+
+```mermaid
 flowchart TD
-    A[Target and options] --> B[Validate request and check cache]
-    B --> C[Search IRSA for overlapping observations]
-    C --> D[Filter by dates, detector, and detector footprint]
-    D --> E[Download or reuse FITS cutouts]
-    E --> F[Locate target and measure its brightness]
-    F --> G[Align images on a common north-up grid]
-    G --> H[Write PNG frames and a JSON manifest]
-    H --> I[Browser plays frames and plots measurements]
+    START[Build request] --> ID[Create dataset ID]
+    ID --> CACHE{Complete dataset exists?}
+    CACHE -- Yes --> READY[Return existing manifest]
+    CACHE -- No --> EXPCACHE{IRSA exposure table cached?}
+    EXPCACHE -- No --> SIA[Query IRSA SIA for exposure metadata]
+    SIA --> SAVEEXP[Save ECSV exposure table]
+    EXPCACHE -- Yes --> FILTER
+    SAVEEXP --> FILTER[Filter rows by footprint, dates, and requested detectors]
+    FILTER --> LIMIT{Within exposure limit?}
+    LIMIT -- No --> ERROR[Report build error]
+    LIMIT -- Yes --> URL[Create target-centred cutout URLs]
+    URL --> FITSCACHE{Matching FITS cutout cached?}
+    FITSCACHE -- Yes --> LOAD[Read cached FITS]
+    FITSCACHE -- No --> FETCH[Fetch FITS cutout from IRSA]
+    FETCH --> LOAD
+    LOAD --> CHECK[Check coverage, flags, and target position]
+    CHECK --> PHOT[Measure target flux, uncertainty, and wavelength]
+    PHOT --> GRID[Reproject image to shared north-up grid]
+    GRID --> PNG[Render display PNGs and write manifest]
+    PNG --> DONE[Browser plays chronologically ordered frames]
+```
+
+### What the browser does with a completed dataset
+
+```mermaid
+flowchart LR
+    MAN[Manifest and frame PNGs] --> MOVIE[Frame slider and playback]
+    MAN --> PLOTS[Flux plots by date and wavelength]
+    MAN --> FILTER[Browser filters and frame checkboxes]
+    FILTER --> MOVIE
+    FILTER --> AB[A/B frame selection]
+    AB --> SAME{Same detector?}
+    SAME -- Yes --> COMPARE[Quick PNG subtraction or two-frame mean]
+    SAME -- No --> WARN[Ask user to choose same-detector frames]
+    FILTER --> STACKSEL[Stack wavelength, date, and checked-frame selection]
+```
+
+### On-demand multi-frame stack
+
+```mermaid
+flowchart TD
+    SELECT[User sets wavelength centre, tolerance, dates, exclusions] --> MATCH[Select matching manifest frames across detectors]
+    MATCH --> COUNT[Show detector counts and warn if detectors are mixed]
+    COUNT --> POST[Submit stack request]
+    POST --> CACHEFITS{All selected FITS cutouts cached?}
+    CACHEFITS -- No --> MISSING[Report missing cutouts; rebuild dataset to fetch]
+    CACHEFITS -- Yes --> READ[Reprocess original floating-point images]
+    READ --> REGISTER[Target-centre and align image, variance, and flags]
+    REGISTER --> MASK[Mask invalid, flagged, or uncovered pixels]
+    MASK --> SKY[Remove local sky and estimate added sky noise]
+    SKY --> WEIGHT[Compute inverse-variance weights per pixel]
+    WEIGHT --> COMBINE[Compute weighted mean, uncertainty, and contributor count]
+    COMBINE --> SAVE[Save NPZ arrays and display PNG maps]
+    SAVE --> VIEW[Display mean, uncertainty, or coverage]
 ```
 
 An **exposure row** is one detector image listed by the archive. One
@@ -199,9 +275,14 @@ not scientific flux subtraction. Comparisons are restricted to one detector
 because different detectors observe different wavelengths.
 
 The separate Stack panel reprocesses selected cached FITS cutouts to recover
-the floating-point images and variance maps. It restricts a stack to one
-detector, an effective-wavelength window at the target, optional dates, and
-the ticked frame rows. Each image is target-centred even if the movie is
+the floating-point images and variance maps. It selects frames by an
+effective-wavelength window at the target, optional dates, and the ticked frame
+rows. The centre can be entered exactly or moved with a slider spanning the
+minimum to maximum wavelength available in the dataset. All detectors are
+eligible, so a sufficiently wide window can include multiple detectors. The
+UI lists their contributor counts and warns about cross-detector stacks because
+their spectral responses and point-spread functions differ. Each image is
+target-centred even if the movie is
 sky-locked. A local residual sky level is removed from each image; bad-flagged
 or uncovered pixels do not contribute. The weighted mean is
 `sum(image / variance) / sum(1 / variance)` at each pixel, and its estimated

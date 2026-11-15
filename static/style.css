@@ -237,6 +237,8 @@ main {
 #stackBox .stack-dates { justify-content: space-between; gap: 8px; }
 #stackBox .stack-dates .field { flex: 1; }
 #stackBox .stack-dates input { width: 100%; }
+#stackBox input[type="range"] { width: 100%; padding: 0; }
+#stackBox .range-ends { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; }
 #stackLayerField { margin-top: 8px; }
 #stackDownload { display: inline-block; margin-top: 8px; color: var(--accent); }
 

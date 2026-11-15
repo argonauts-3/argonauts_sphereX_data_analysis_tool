@@ -183,15 +183,18 @@
     <section id="stackBox">
       <h2>Stack similar wavelengths</h2>
       <div class="field">
-        <label for="stackBandSelect">Detector</label>
-        <select id="stackBandSelect"></select>
-      </div>
-      <div class="field">
         <label for="stackWavelengthSelect">Wavelength centre (µm)</label>
         <input id="stackWavelengthSelect" type="number" min="0.000001"
                max="19.999999" step="any" list="stackWavelengthOptions"
                inputmode="decimal" required>
         <datalist id="stackWavelengthOptions"></datalist>
+      </div>
+      <div class="field">
+        <label for="stackWavelengthSlider">Wavelength centre slider</label>
+        <input id="stackWavelengthSlider" type="range" min="0" max="1"
+               step="0.000001" value="0" disabled>
+        <div class="range-ends"><span id="stackWavelengthMin">—</span>
+          <span id="stackWavelengthMax">—</span></div>
       </div>
       <div class="field">
         <label for="stackToleranceInput">Tolerance (± µm)</label>
@@ -218,7 +221,7 @@
         </select>
       </div>
       <a id="stackDownload" hidden download>Download float stack data (.npz)</a>
-      <p class="note" id="stackStatus">Choose one detector and wavelength range.
+      <p class="note" id="stackStatus">Choose a wavelength range.
         Only ticked frames are considered. Stacking reprocesses cached FITS cutouts.</p>
     </section>
 
@@ -308,13 +311,17 @@
       <code>lo</code>, <code>hi</code>).</p>
 
     <h3>Stack more than two frames</h3>
-    <p>In <strong>Stack similar wavelengths</strong>, choose one detector and
-      type the exact wavelength centre in microns, or pick a suggested value
-      from the frames. Set the ± tolerance; only checked frames from that
-      detector within the wavelength window and optional date limits are used.
-      At least two frames must match. The stack reprocesses cached FITS cutouts
-      and aligns the target before combining images. Choose the weighted mean,
-      estimated uncertainty, or contributing-frame map. Download the NPZ for
+    <p>In <strong>Stack similar wavelengths</strong>, type the exact
+      wavelength centre in microns, use the slider, or pick a suggested value
+      from the frames. The slider spans the wavelengths available in the
+      current dataset. Set the ± tolerance and optional date limits; all
+      checked frames in that wavelength window are candidates, including frames
+      from multiple detectors if the window reaches them. The live selection
+      summary lists detector counts and warns about cross-detector stacks,
+      whose responses and point-spread functions can differ. At least two
+      frames must match. The stack reprocesses cached FITS cutouts and aligns
+      the target before combining images. Choose the weighted mean, estimated
+      uncertainty, or contributing-frame map. Download the NPZ for
       floating-point arrays. Narrow the dates when studying a variable source,
       since stacking combines the selected epochs.</p>
 

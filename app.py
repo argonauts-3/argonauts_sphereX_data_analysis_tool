@@ -445,7 +445,7 @@ def _iso_date(value, label):
 
 @app.post("/api/stack/<key>")
 def api_stack(key):
-    """Queue a same-detector inverse-variance stack from cached FITS cutouts."""
+    """Queue a wavelength-selected inverse-variance stack from cached cutouts."""
     if not ID_RE.match(key):
         return jsonify(error="bad dataset id"), 400
     body = request.get_json(force=True, silent=True)
@@ -462,9 +462,6 @@ def api_stack(key):
     if manifest.get("complete") is False:
         return jsonify(error="wait for the full dataset before stacking"), 409
 
-    band = body.get("band")
-    if band not in pipeline.BANDS:
-        return jsonify(error="choose one valid detector"), 400
     try:
         wavelength_center = float(body.get("wavelength_center_um"))
         wavelength_tolerance = float(body.get("wavelength_tolerance_um"))
@@ -497,7 +494,7 @@ def api_stack(key):
     selected = []
     for entry in all_frames:
         index = entry.get("index")
-        if index not in valid_indices or entry.get("band") != band:
+        if index not in valid_indices or entry.get("band") not in pipeline.BANDS:
             continue
         wavelength = entry.get("wavelength_um")
         if wavelength is None or not np.isfinite(float(wavelength)):
@@ -516,7 +513,6 @@ def api_stack(key):
                               "at least two are needed"), 400
 
     params = {
-        "band": band,
         "wavelength_center_um": round(wavelength_center, 8),
         "wavelength_tolerance_um": round(wavelength_tolerance, 8),
         "date_start": date_start,

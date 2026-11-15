@@ -690,11 +690,13 @@ def build_stack_from_cutouts(dataset_key, stack_key, manifest, entries,
     frame_wavelengths = [float(frame.wavelength_um) for frame in frames
                          if np.isfinite(frame.wavelength_um)]
     frame_dates = [frame.obs_time.iso[:10] for frame in frames]
+    frame_bands = sorted({frame.band for frame in frames})
     covered_uncertainty = uncertainty[covered]
     metadata = {
         "id": stack_key,
         "dataset_id": dataset_key,
-        "band": frames[0].band,
+        "bands": frame_bands,
+        "cross_detector": len(frame_bands) > 1,
         "n_selected": len(entries),
         "n_used": len(frames),
         "wavelength_center_um": float(params["wavelength_center_um"]),
