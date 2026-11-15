@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.jupyter/
+.jupyter_ystore.db
+
+# Generated data: cutout cache, app datasets, pipeline figures, SIA tables
+cutout_cache/
+data/
+contact_sheet.png
+spectrum.png
+aperture_check.png
+*.ecsv
