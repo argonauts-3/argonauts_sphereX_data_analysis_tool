@@ -213,14 +213,20 @@ def find_target() -> SkyCoord:
     return make_target(FALLBACK_RA, FALLBACK_DEC)
 
 
-def target_position_at(target: SkyCoord, when: Time) -> SkyCoord:
+def target_position_at(target: SkyCoord, when: Time,
+                       proper_motion=None) -> SkyCoord:
     """Where is the target at time `when`?  Applies the proper motion above.
 
     Example: WISE 0855 moves about -8.12" in RA per year, so ten years after
     J2000 it sits ~81" away from its J2000 position.
+
+    `proper_motion` is an optional (pm_ra_cosdec, pm_dec) pair.  When it is
+    None the module default (WISE 0855's) is used, which keeps the original
+    script behaviour; the web app passes (0, 0) for a fixed RA/Dec field.
     """
+    pm_ra, pm_dec = (PM_RA, PM_DEC) if proper_motion is None else proper_motion
     moving = SkyCoord(ra=target.ra, dec=target.dec,
-                      pm_ra_cosdec=PM_RA, pm_dec=PM_DEC,
+                      pm_ra_cosdec=pm_ra, pm_dec=pm_dec,
                       obstime=Time("J2000"), frame="icrs")
     return moving.apply_space_motion(new_obstime=when)
 
@@ -391,12 +397,16 @@ def fetch_cutout(access_url, ra_deg, dec_deg, size_deg,
         response.raise_for_status()
 
 
-def prefetch_cutouts(rows, ra_deg, dec_deg, size_deg, workers=None) -> set:
+def prefetch_cutouts(rows, ra_deg, dec_deg, size_deg, workers=None,
+                     cutout_dir=None, progress=None) -> set:
     """Download every cutout that is not cached yet, several at a time.
 
     Each URL maps to its own cache file, so the threads never collide.  Only
     the downloads are parallel; the measuring loop still runs in order, so the
     printed table is identical to a serial run.
+
+    `progress(done, total)` is called as each download finishes, for the web
+    app's progress bar.
 
     Returns the obs_ids that could not be downloaded, so the caller can skip
     them once instead of retrying each of them slowly and serially.
@@ -405,17 +415,20 @@ def prefetch_cutouts(rows, ra_deg, dec_deg, size_deg, workers=None) -> set:
     missing = []
     for row in rows:
         url = cutout_url(row["access_url"], ra_deg, dec_deg, size_deg)
-        if not cutout_cache_path(url).exists():
+        if not cutout_cache_path(url, cutout_dir).exists():
             missing.append(row)
     if not missing:
+        if progress is not None:
+            progress(0, 0)
         return set()
 
     print(f"downloading {len(missing)} cutouts, {workers} at a time")
     failed = set()
+    done = 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
         jobs = {
             pool.submit(fetch_cutout, row["access_url"], ra_deg, dec_deg,
-                        size_deg, CUTOUT_CACHE_DIR): row["obs_id"]
+                        size_deg, cutout_dir): row["obs_id"]
             for row in missing
         }
         for job in as_completed(jobs):
@@ -428,6 +441,9 @@ def prefetch_cutouts(rows, ra_deg, dec_deg, size_deg, workers=None) -> set:
             except (requests.HTTPError, OSError) as exc:
                 print("  skip (HTTP):", obs_id, exc)
                 failed.add(obs_id)
+            done += 1
+            if progress is not None:
+                progress(done, len(missing))
     return failed
 
 
@@ -641,7 +657,8 @@ class Frame:
         return 100.0 * float(np.mean((self.flags & self.bad_bits) != 0))
 
 
-def load_frame(row, band, target, reference, cutout_size_deg) -> Optional[Frame]:
+def load_frame(row, band, target, reference, cutout_size_deg,
+               proper_motion=None, cutout_dir=None) -> Optional[Frame]:
     """Download one cutout and measure the target in it.
 
     `row` is one line of the archive's exposure table.  `reference` is the
@@ -650,7 +667,7 @@ def load_frame(row, band, target, reference, cutout_size_deg) -> Optional[Frame]
     """
     try:
         hdul = fetch_cutout(row["access_url"], reference.ra.deg, reference.dec.deg,
-                            cutout_size_deg, cache_dir=CUTOUT_CACHE_DIR)
+                            cutout_size_deg, cache_dir=cutout_dir)
     except NotCovered:
         print("  skip (off footprint):", row["obs_id"])
         return None
@@ -665,7 +682,7 @@ def load_frame(row, band, target, reference, cutout_size_deg) -> Optional[Frame]
         # Where is the target *in this exposure*?  It moves up to 8"/yr, so
         # we re-compute its position for each exposure's date.
         obs_time = Time(row["t_min"], format="mjd")
-        position = target_position_at(target, obs_time)
+        position = target_position_at(target, obs_time, proper_motion)
         x, y = wcs.world_to_pixel(position)
         x, y = float(x), float(y)
         ix, iy = int(round(x)), int(round(y))
@@ -727,20 +744,28 @@ def load_frame(row, band, target, reference, cutout_size_deg) -> Optional[Frame]
         )
 
 
-def download_frames(exposures, bands_present, target, reference, cutout_size_deg):
-    """Load frames for every band, oldest exposures first."""
+def download_frames(exposures, bands_present, target, reference, cutout_size_deg,
+                    max_frames=None, workers=None, cutout_dir=None,
+                    proper_motion=None, progress=None):
+    """Load frames for every band, oldest exposures first.
+
+    `max_frames` caps the exposures per band (None = all).  `progress` is
+    forwarded to prefetch_cutouts for the app's progress bar.
+    """
     # Decide what to load before touching the network, so all the downloads
     # can happen at once in prefetch_cutouts().
     plan = []
     for band in bands_present:
         rows = exposures[exposures["energy_bandpassname"] == band]
         rows = rows[np.argsort(np.asarray(rows["t_min"], dtype=float))]
-        if MAX_FRAMES_PER_BAND is not None:
-            rows = rows[:MAX_FRAMES_PER_BAND]
+        if max_frames is not None:
+            rows = rows[:max_frames]
         plan.append((band, rows))
 
     failed = prefetch_cutouts([row for _, rows in plan for row in rows],
-                              reference.ra.deg, reference.dec.deg, cutout_size_deg)
+                              reference.ra.deg, reference.dec.deg,
+                              cutout_size_deg, workers=workers,
+                              cutout_dir=cutout_dir, progress=progress)
 
     frames = []
     for band, rows in plan:
@@ -748,7 +773,9 @@ def download_frames(exposures, bands_present, target, reference, cutout_size_deg
         for row in rows:
             if row["obs_id"] in failed:
                 continue
-            frame = load_frame(row, band, target, reference, cutout_size_deg)
+            frame = load_frame(row, band, target, reference, cutout_size_deg,
+                               proper_motion=proper_motion,
+                               cutout_dir=cutout_dir)
             if frame is not None:
                 frames.append(frame)
 
@@ -791,15 +818,22 @@ def shifted_wcs(wcs, shift_ra_deg, shift_dec_deg):
     return shifted
 
 
-def align_frames(frames, ra, dec):
-    """Resample every frame onto one common grid (stored in frame.*_aligned)."""
-    out_wcs, n = north_up_wcs(ra, dec, FIELD_OF_VIEW_DEG)
+def align_frames(frames, ra, dec, fov_deg=None, track=True):
+    """Resample every frame onto one common grid (stored in frame.*_aligned).
+
+    `track=True` shifts each frame so the moving target stays at the centre.
+    `track=False` keeps the grid fixed on the sky, which is what you want to
+    watch everything move (including the target).
+    """
+    fov_deg = FIELD_OF_VIEW_DEG if fov_deg is None else fov_deg
+    out_wcs, n = north_up_wcs(ra, dec, fov_deg)
     print(f"\noutput grid: {n}x{n} px, 6.1577\"/px, north up")
 
     for frame in frames:
         # Register on the moving target, not the background stars, so the
         # target lands on the same pixel in every epoch.
-        wcs = shifted_wcs(frame.wcs, frame.shift_ra_deg, frame.shift_dec_deg)
+        wcs = shifted_wcs(frame.wcs, frame.shift_ra_deg,
+                          frame.shift_dec_deg) if track else frame.wcs
 
         frame.image_aligned, frame.footprint = reproject_interp(
             (frame.image, wcs), out_wcs, shape_out=(n, n))
@@ -1042,7 +1076,8 @@ def main():
     if missing:
         print("no exposures in:", ", ".join(missing))
 
-    frames = download_frames(exposures, bands_present, target, reference, cutout_size_deg)
+    frames = download_frames(exposures, bands_present, target, reference,
+                             cutout_size_deg, max_frames=MAX_FRAMES_PER_BAND)
     if not frames:
         raise SystemExit("no cutouts retrieved")
 
